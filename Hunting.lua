@@ -1369,6 +1369,16 @@ do
         local enabled = false
         local farmRequested = false
         local pumpkinEnabled = false
+        local partyFarmEnabled = false
+        local partyFarmRadius = 60
+        local partyFarmData
+        local partyFarmLeaderRoot
+        local partySearch
+        local partySearching = false
+
+        -- ค่ารอที่สคริปต์กำหนดเอง
+        local PARTY_SEARCH_WAIT = 4
+        local PARTY_SEARCH_RETRY = 30
         local potionTripActive = false
         local farmTravelActive = false
         local dropTripActive = false
@@ -1824,7 +1834,325 @@ do
             return nil
         end
 
+        local function UpdateFarmParty()
+            partyFarmData = nil
+
+            local raw = LocalPlayer:GetAttribute("PartyJson")
+            if type(raw) ~= "string" or raw == "" then
+                return
+            end
+
+            local ok, data = pcall(
+                HttpService.JSONDecode, HttpService, raw
+            )
+
+            if not ok or type(data) ~= "table"
+                or type(data.Leader) ~= "number"
+                or data.Leader ~= data.Leader
+                or data.Leader <= 0
+                or data.Leader == math.huge
+                or data.Leader % 1 ~= 0
+                or type(data.Members) ~= "table" then
+                return
+            end
+
+            local hasLocal = false
+            local hasLeader = false
+
+            for _, member in ipairs(data.Members) do
+                if type(member) == "table" then
+                    if member.UserId == LocalPlayer.UserId then
+                        hasLocal = true
+                    end
+
+                    if member.UserId == data.Leader then
+                        hasLeader = true
+                    end
+                end
+            end
+
+            if hasLocal and hasLeader then
+                partyFarmData = data
+            end
+        end
+
+        Connect(
+            LocalPlayer:GetAttributeChangedSignal("PartyJson"),
+            UpdateFarmParty
+        )
+
+        UpdateFarmParty()
+
+        local function BuildPartySearchPlan(level, leaderId)
+            partySearching = true
+
+            local character = LocalPlayer.Character
+            local humanoid = character
+                and character:FindFirstChildOfClass("Humanoid")
+            local root = humanoid and humanoid.RootPart
+
+            if not root or not root:IsA("BasePart")
+                or not humanoid or humanoid.Health <= 0 then
+                return nil, nil, "Party Search: waiting for character"
+            end
+
+            if not gatesValid then
+                return nil, nil, "Party Search: waiting for gate data"
+            end
+
+            local gateState =
+                LocalPlayer:GetAttribute("BossGatesJson")
+
+            if partySearch and (
+                partySearch.LeaderId ~= leaderId
+                or partySearch.Character ~= character
+                or partySearch.Level ~= level
+                or partySearch.GateState ~= gateState
+            ) then
+                partySearch = nil
+            end
+
+            if not partySearch then
+                local zoneFolder = workspace:FindFirstChild("Zones")
+                if not zoneFolder then
+                    return nil, nil, "Party Search: waiting for zones"
+                end
+
+                local route = {}
+                local nearestIndex
+                local nearestDistance = math.huge
+
+                for _, zone in ipairs(zones) do
+                    local allowed = zone.Data.BossRoom ~= true
+                        and CanAccess(zone, level)
+
+                    if allowed then
+                        for _, requirement in ipairs(requirements) do
+                            if requirement.Order > zone.Order then
+                                break
+                            end
+
+                            if bossGates[requirement.GateId] ~= true then
+                                allowed = false
+                                break
+                            end
+                        end
+                    end
+
+                    local part = zoneFolder:FindFirstChild(zone.Id)
+
+                    if allowed and part and part:IsA("BasePart") then
+                        table.insert(route, zone)
+                    end
+                end
+
+                table.sort(route, function(a, b)
+                    return a.Order < b.Order
+                end)
+
+                for index, zone in ipairs(route) do
+                    local part = zoneFolder:FindFirstChild(zone.Id)
+                    local distance =
+                        (part.Position - root.Position).Magnitude
+
+                    if distance < nearestDistance then
+                        nearestDistance = distance
+                        nearestIndex = index
+                    end
+                end
+
+                if not nearestIndex then
+                    return nil, nil,
+                        "Party Search: no accessible loaded fields"
+                end
+
+                partySearch = {
+                    LeaderId = leaderId,
+                    Character = character,
+                    Level = level,
+                    GateState = gateState,
+                    Route = route,
+                    Index = nearestIndex,
+                    Direction = 1,
+                    Visited = {},
+                    ArrivedAt = nil,
+                }
+            end
+
+            local search = partySearch
+            local now = os.clock()
+
+            if search.RetryAt then
+                if now < search.RetryAt then
+                    return nil, nil,
+                        "Party Search: not found; waiting to search again"
+                end
+
+                table.clear(search.Visited)
+                search.RetryAt = nil
+                search.ArrivedAt = nil
+            end
+
+            local allVisited = true
+
+            for _, zone in ipairs(search.Route) do
+                if not search.Visited[zone.Id] then
+                    allVisited = false
+                    break
+                end
+            end
+
+            if allVisited then
+                search.RetryAt = now + PARTY_SEARCH_RETRY
+                return nil, nil,
+                    "Party Search: accessible fields checked; leader not found"
+            end
+
+            -- เดินตามลำดับโซน กลับทิศเมื่อสุดทาง
+            -- ไม่ข้ามจากปลายแมพกลับต้นแมพในครั้งเดียว
+            if search.Advance then
+                local nextIndex = search.Index + search.Direction
+
+                if nextIndex < 1 or nextIndex > #search.Route then
+                    search.Direction = -search.Direction
+                    nextIndex = search.Index + search.Direction
+                end
+
+                search.Index = math.clamp(
+                    nextIndex, 1, #search.Route
+                )
+
+                search.Advance = false
+                search.ArrivedAt = nil
+            end
+
+            local goal = search.Route[search.Index]
+
+            return goal, {}, "Party Search: " .. goal.Id
+        end
+
+        local function BuildPartyFarmPlan(level)
+            partyFarmLeaderRoot = nil
+            partySearching = false
+
+            if not partyFarmData then
+                return nil, nil, "Party Farm: waiting for party"
+            end
+
+            local leader = Players:GetPlayerByUserId(
+                partyFarmData.Leader
+            )
+
+            local character = leader and leader.Character
+            local humanoid = character
+                and character:FindFirstChildOfClass("Humanoid")
+            local root = humanoid and humanoid.RootPart
+
+            if not leader then
+                partySearch = nil
+                return nil, nil, "Party Farm: leader is not in this server"
+            end
+
+            if leader:GetAttribute("InTown") == true then
+                partySearch = nil
+                return nil, nil, "Party Farm: leader is in town"
+            end
+
+            if humanoid and humanoid.Health <= 0 then
+                return nil, nil, "Party Farm: waiting for leader to respawn"
+            end
+
+            if not humanoid
+                or not root or not root:IsA("BasePart")
+                or not root.Parent then
+                return BuildPartySearchPlan(
+                    level, partyFarmData.Leader
+                )
+            end
+
+            -- พบตัวหัวหน้าที่โหลดจริงแล้ว
+            partySearch = nil
+
+            local zoneFolder = workspace:FindFirstChild("Zones")
+            if not zoneFolder then
+                return nil, nil, "Party Farm: waiting for zones"
+            end
+
+            local chosen
+            local smallestArea = math.huge
+
+            for _, zone in ipairs(zones) do
+                local part = zoneFolder:FindFirstChild(zone.Id)
+
+                if part and part:IsA("BasePart") then
+                    local point =
+                        part.CFrame:PointToObjectSpace(root.Position)
+
+                    if math.abs(point.X) <= part.Size.X / 2
+                        and math.abs(point.Z) <= part.Size.Z / 2 then
+
+                        local area = part.Size.X * part.Size.Z
+
+                        if area < smallestArea then
+                            smallestArea = area
+                            chosen = zone
+                        end
+                    end
+                end
+            end
+
+            if not chosen then
+                return nil, nil,
+                    "Party Farm: waiting for leader field"
+            end
+
+            if chosen.Data.BossRoom == true then
+                return nil, nil,
+                    "Party Farm: waiting for leader in a regular field"
+            end
+
+            if not CanAccess(chosen, level) then
+                return nil, nil,
+                    "Party Farm: leader field requires a higher level"
+            end
+
+            if not gatesValid then
+                return nil, nil,
+                    "Party Farm: waiting for BossGatesJson"
+            end
+
+            for _, requirement in ipairs(requirements) do
+                if requirement.Order > chosen.Order then break end
+
+                if bossGates[requirement.GateId] ~= true then
+                    return nil, nil,
+                        "Party Farm: clear "
+                            .. requirement.GateId .. " first"
+                end
+            end
+
+            local ids = {}
+
+            for id in pairs(chosen.Ids) do
+                if IsRegular(id) then
+                    ids[id] = true
+                end
+            end
+
+            if not next(ids) then
+                return nil, nil,
+                    "Party Farm: no regular monsters in this field"
+            end
+
+            partyFarmLeaderRoot = root
+            return chosen, ids
+        end
+
         local function BuildPlan(level)
+            if partyFarmEnabled then
+                return BuildPartyFarmPlan(level)
+            end
+
             if pumpkinEnabled then
                 local zone, ids, reason, gateId, eventTarget =
                     BuildPumpkinPlan(level)
@@ -2737,7 +3065,8 @@ do
             return true
         end
 
-        local function BuildTravelHops(goal, position, level)
+        local function BuildTravelHops(goal, position, level, stepSize)
+            stepSize = stepSize == 1 and 1 or 2
             local spatial = FindPullZone(position)
             local current = spatial and zoneById[spatial.Name]
 
@@ -2796,7 +3125,7 @@ do
                 table.insert(hops, current)
             end
 
-            for index = 2, #between, 2 do
+            for index = stepSize, #between, stepSize do
                 table.insert(hops, between[index])
             end
 
@@ -2829,13 +3158,34 @@ do
                     return false
                 end
 
+                local stepSize = partyFarmEnabled and 1 or 2
+                local hops
+
+                if partyFarmEnabled then
+                    hops = BuildTravelHops(
+                        zone, root.Position, level, stepSize
+                    )
+
+                    if not hops or #hops == 0 then
+                        SetStatus(
+                            "Party Farm: no accessible route to leader"
+                        )
+                        return false
+                    end
+                end
+
                 farmTravel = {
                     Goal = zone,
                     Character = character,
                     Root = root,
                     AutoWasOn = autoOn,
                     StartedAt = os.clock(),
-                    Direct = true,
+
+                    -- Party เดินทางทีละโซนทันที
+                    Direct = not partyFarmEnabled,
+                    StepSize = stepSize,
+                    Hops = hops,
+                    Index = 1,
                     Attempts = 0,
                 }
 
@@ -2885,7 +3235,10 @@ do
                 elseif travel.Direct then
                     travel.Direct = false
                     travel.Hops = BuildTravelHops(
-                        zone, root.Position, level
+                        zone,
+                        root.Position,
+                        level,
+                        travel.StepSize
                     )
                     travel.Index = 1
                     travel.Attempts = 0
@@ -2918,7 +3271,10 @@ do
                 if travel.Direct then
                     travel.Direct = false
                     travel.Hops = BuildTravelHops(
-                        zone, root.Position, level
+                        zone,
+                        root.Position,
+                        level,
+                        travel.StepSize
                     )
                     travel.Index = 1
 
@@ -3791,6 +4147,56 @@ do
                 end
             end
 
+            if partyFarmEnabled and partySearching then
+                local search = partySearch
+
+                if not search then
+                    ClearTarget()
+                    SetStatus("Party Search: preparing route")
+                    return
+                end
+
+                ResetPull(true)
+                ClearTarget()
+
+                humanoid:Move(Vector3.zero, false)
+
+                HoldFarmPosition(
+                    humanoid,
+                    root,
+                    root.Position,
+                    root.CFrame
+                )
+
+                -- โซนที่เคยรอโหลดแล้ว ใช้เป็นทางผ่าน
+                if search.Visited[zone.Id] then
+                    search.Advance = true
+                    SetStatus("Party Search: passing " .. zone.Id)
+                    return
+                end
+
+                if not search.ArrivedAt then
+                    search.ArrivedAt = os.clock()
+                end
+
+                local elapsed = os.clock() - search.ArrivedAt
+
+                SetStatus(string.format(
+                    "Party Search: %s | loading %.1f / %.1fs",
+                    zone.Id,
+                    elapsed,
+                    PARTY_SEARCH_WAIT
+                ))
+
+                if elapsed >= PARTY_SEARCH_WAIT then
+                    search.Visited[zone.Id] = true
+                    search.Advance = true
+                    search.ArrivedAt = nil
+                end
+
+                return
+            end
+
             local function Eligible(model)
                 local id = model:GetAttribute("MonsterId")
                 if not ids[id] then return nil end
@@ -3806,10 +4212,73 @@ do
                     return nil
                 end
 
-                return GetMonsterPart(model)
+                local part = GetMonsterPart(model)
+                if not part then return nil end
+
+                if partyFarmEnabled then
+                    local leaderRoot = partyFarmLeaderRoot
+
+                    if not leaderRoot or not leaderRoot.Parent then
+                        return nil
+                    end
+
+                    local offset = part.Position - leaderRoot.Position
+                    local distance = Vector3.new(
+                        offset.X, 0, offset.Z
+                    ).Magnitude
+
+                    if distance > partyFarmRadius then
+                        return nil
+                    end
+                end
+
+                return part
             end
 
-            if bossGateId or eventTarget then
+            if partyFarmEnabled and partyFarmLeaderRoot
+                and partyFarmLeaderRoot.Parent
+                and partyFarmData
+                and partyFarmData.Leader ~= LocalPlayer.UserId then
+
+                local offset =
+                    root.Position - partyFarmLeaderRoot.Position
+
+                local distance = Vector3.new(
+                    offset.X, 0, offset.Z
+                ).Magnitude
+
+                -- ตามเมื่อออกห่างมากพอ ไม่วาปตามทุก Tick
+                if distance > partyFarmRadius + 20 then
+                    ResetPull(true)
+                    ClearTarget()
+
+                    if isCasting then
+                        SetStatus("Party Farm: waiting for cast to finish")
+                        return
+                    end
+
+                    -- ใช้ตำแหน่งหัวหน้าที่โหลดจริง
+                    local destination = partyFarmLeaderRoot.Position
+                        + Vector3.new(0, 4, 0)
+
+                    local facing = CFrame.new(destination)
+                        * root.CFrame.Rotation
+
+                    humanoid:Move(Vector3.zero, false)
+                    root.CFrame = facing
+                    root.AssemblyLinearVelocity = Vector3.zero
+                    root.AssemblyAngularVelocity = Vector3.zero
+
+                    HoldFarmPosition(
+                        humanoid, root, destination, facing
+                    )
+
+                    SetStatus("Party Farm: following leader")
+                    return
+                end
+            end
+
+            if bossGateId or eventTarget or partyFarmEnabled then
                 -- หยุดลากมอน เพื่อโฟกัสบอสปลดด่าน
                 if pullSession then
                     ResetPull(true)
@@ -4164,10 +4633,59 @@ do
 
                 farmRequested = value == true
 
-                if farmRequested or pumpkinEnabled then
+                if farmRequested or pumpkinEnabled
+                    or partyFarmEnabled then
                     Start()
                 else
                     Stop()
+                end
+            end,
+        })
+
+        local partyFarmSection = Tabs.Party:AddSection({
+            Title = "Party Farming",
+            Icon = "swords",
+        })
+
+        partyFarmSection:AddToggle("ZeroXFarmWithParty", {
+            Title = "Farm With Party",
+            Description = "ตามหัวหน้าปาร์ตี้และฟาร์มมอนรอบตัวหัวหน้า "
+                .. "ใช้ระยะโจมตีและระบบลอยเดิม "
+                .. "พักการลากมอนระหว่างเปิดใช้งาน",
+            Default = false,
+
+            Callback = function(value)
+                if not alive then return end
+
+                partyFarmEnabled = value == true
+                partyFarmLeaderRoot = nil
+
+                FinishFarmTravel(true)
+                ResetPull(true)
+                ClearTarget()
+
+                if partyFarmEnabled
+                    or farmRequested or pumpkinEnabled then
+                    Start()
+                else
+                    Stop()
+                end
+            end,
+        })
+
+        partyFarmSection:AddSlider("ZeroXPartyFarmRadius", {
+            Title = "Farm Radius",
+            Description = "รัศมีเลือกมอนรอบหัวหน้า หน่วย studs "
+                .. "เป็นค่าของสคริปต์ ไม่ใช่ระยะแชร์ EXP ของเกม",
+            Min = 20,
+            Max = 80,
+            Default = 60,
+            Increment = 5,
+
+            Callback = function(value)
+                if type(value) == "number"
+                    and value >= 20 and value <= 80 then
+                    partyFarmRadius = value
                 end
             end,
         })
@@ -6440,7 +6958,8 @@ do
                     ResetPull(true)
                     ClearTarget()
 
-                    if pumpkinEnabled or farmRequested then
+                    if pumpkinEnabled or farmRequested
+                        or partyFarmEnabled then
                         Start()
                     else
                         Stop()
