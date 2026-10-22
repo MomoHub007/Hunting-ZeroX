@@ -1,6 +1,12 @@
 local print = function() end
 local warn = function() end
 
+if not game:IsLoaded() then
+    repeat
+        game.Loaded:Wait()
+    until game:IsLoaded()
+end
+
 local BASE = (getgenv and getgenv().MacUIBase) or "https://raw.githubusercontent.com/Kiwzu/Mac-OS-UI-LUA/refs/heads/main/"
 
 local MacUI = loadstring(game:HttpGet(BASE .. "MacUIFramework.lua"))()
@@ -505,6 +511,10 @@ local Tabs = {
         Title = "Event",
         Icon = "gift",
     }),
+    Party = Window:AddTab({
+        Title = "Party",
+        Icon = "users",
+    }),
     Player = Window:AddTab({
         Title = "Player",
         Icon = "user",
@@ -520,6 +530,779 @@ local Tabs = {
         Icon = "folder",
     }),
 }
+
+do
+    local HttpService = game:GetService("HttpService")
+    local RS = game:GetService("ReplicatedStorage")
+
+    local active = true
+    local connections = {}
+    local playerConnections = {}
+
+    local partyCache = {}
+    local knownPlayers = {}
+    local labelToId = {}
+
+    local selectedPlayer
+    local selectedMember
+    local selectedInviter
+    local whitelist = {}
+
+    local autoInvite = false
+    local autoAccept = false
+    local autoInviteAll = false
+    local autoAcceptAll = false
+    local retrySeconds = 60
+
+    local invitations = {}
+    local lastInvite = {}
+    local lastSend = -math.huge
+    local inviteCursor = 0
+    local promotion
+
+    local playerDropdown
+    local memberDropdown
+    local inviteDropdown
+    local whitelistDropdown
+
+    local management = Tabs.Party:AddSection({
+        Title = "Party Management",
+        Icon = "users",
+    })
+
+    local inviteSection = Tabs.Party:AddSection({
+        Title = "Invitations",
+        Icon = "user-plus",
+    })
+
+    local memberSection = Tabs.Party:AddSection({
+        Title = "Members",
+        Icon = "users",
+    })
+
+    local automation = Tabs.Party:AddSection({
+        Title = "Party Automation",
+        Icon = "settings",
+    })
+
+    local status = management:AddLabel({
+        Title = "Party Status",
+        Value = "กำลังตรวจสอบข้อมูล",
+    })
+
+    local roster = management:AddLabel({
+        Title = "Party Members",
+        Value = "-",
+    })
+
+    local function Report(message)
+        if active then
+            status:SetValue(message)
+        end
+    end
+
+    local function Connect(signal, callback)
+        local connection = signal:Connect(callback)
+        table.insert(connections, connection)
+        return connection
+    end
+
+    local function FiniteNumber(value)
+        return type(value) == "number"
+            and value == value
+            and math.abs(value) < math.huge
+    end
+
+    -- false = ไม่มีปาร์ตี้
+    -- nil = ข้อมูลไม่ถูกต้อง จึงไม่ส่งคำสั่งอัตโนมัติ
+    local function ReadParty(player)
+        local raw = player:GetAttribute("PartyJson")
+
+        if raw == nil or raw == "" then
+            return false
+        end
+
+        if type(raw) ~= "string" then
+            return nil
+        end
+
+        local ok, data = pcall(
+            HttpService.JSONDecode, HttpService, raw
+        )
+
+        if not ok or type(data) ~= "table"
+            or not FiniteNumber(data.Leader)
+            or type(data.Members) ~= "table" then
+            return nil
+        end
+
+        local count = 0
+        local seen = {}
+
+        for key, member in pairs(data.Members) do
+            if type(key) ~= "number"
+                or key < 1 or key % 1 ~= 0
+                or type(member) ~= "table"
+                or not FiniteNumber(member.UserId)
+                or member.UserId <= 0
+                or member.UserId % 1 ~= 0
+                or seen[member.UserId] then
+                return nil
+            end
+
+            count += 1
+            seen[member.UserId] = true
+        end
+
+        if count ~= #data.Members then
+            return nil
+        end
+
+        return data
+    end
+
+    local maxMembers = 6 -- ค่าที่ตรวจพบจาก GameConfig
+
+    local shared = RS:FindFirstChild("Shared")
+    local configModule = shared
+        and shared:FindFirstChild("GameConfig")
+
+    if configModule and configModule:IsA("ModuleScript") then
+        local ok, config = pcall(require, configModule)
+
+        if ok and type(config) == "table"
+            and FiniteNumber(config.PartyMaxMembers)
+            and config.PartyMaxMembers >= 1 then
+            maxMembers = math.floor(config.PartyMaxMembers)
+        end
+    end
+
+    local function LocalParty()
+        return partyCache[LocalPlayer.UserId]
+    end
+
+    local function IsMember(party, userId)
+        if type(party) ~= "table" then return false end
+
+        for _, member in ipairs(party.Members) do
+            if member.UserId == userId then
+                return true
+            end
+        end
+
+        return false
+    end
+
+    local function IsLeader()
+        local party = LocalParty()
+
+        return type(party) == "table"
+            and party.Leader == LocalPlayer.UserId
+    end
+
+    local function Send(action, ...)
+        if not active then return false end
+
+        -- ระยะห่างที่สคริปต์กำหนดเอง ไม่ใช่ค่าจำกัดของเซิร์ฟเวอร์
+        if os.clock() - lastSend < 1 then
+            return false
+        end
+
+        local remotes = RS:FindFirstChild("Remotes")
+        local remote = remotes
+            and remotes:FindFirstChild("PartyAction")
+
+        if not remote or not remote:IsA("RemoteEvent") then
+            Report("ไม่พบ PartyAction ที่เป็น RemoteEvent")
+            return false
+        end
+
+        lastSend = os.clock()
+        remote:FireServer(action, ...)
+
+        Report("ส่งคำขอ " .. action .. " แล้ว")
+        return true
+    end
+
+    local function PlayerLabel(player)
+        return string.format(
+            "%s [%d]", player.Name, player.UserId
+        )
+    end
+
+    local function Refresh()
+        if not active then return end
+
+        local party = LocalParty()
+        local memberValues = {}
+        local names = {}
+
+        if type(party) == "table" then
+            for _, member in ipairs(party.Members) do
+                local name = type(member.Name) == "string"
+                    and member.Name or tostring(member.UserId)
+
+                table.insert(names, name)
+
+                if member.UserId ~= LocalPlayer.UserId then
+                    local label = string.format(
+                        "%s [%d]", name, member.UserId
+                    )
+
+                    labelToId[label] = member.UserId
+                    table.insert(memberValues, label)
+                end
+            end
+
+            Report(string.format(
+                "%d/%d คน | %s",
+                #party.Members,
+                maxMembers,
+                party.Leader == LocalPlayer.UserId
+                    and "หัวหน้าปาร์ตี้" or "สมาชิก"
+            ))
+        elseif party == false then
+            Report("ยังไม่มีปาร์ตี้")
+        else
+            Report("อ่าน PartyJson ไม่ได้")
+        end
+
+        roster:SetValue(
+            #names > 0 and table.concat(names, ", ") or "-"
+        )
+
+        local onlineValues = {}
+
+        for _, player in ipairs(Players:GetPlayers()) do
+            if player ~= LocalPlayer then
+                local label = PlayerLabel(player)
+
+                knownPlayers[player.UserId] = label
+                labelToId[label] = player.UserId
+
+                table.insert(onlineValues, label)
+            end
+        end
+
+        table.sort(onlineValues)
+        table.sort(memberValues)
+
+        -- เก็บรายชื่อที่เคยพบไว้ เพื่อไม่ล้าง Whitelist
+        -- ทันทีที่ผู้เล่นออกจากเซิร์ฟเวอร์
+        local whitelistValues = {}
+
+        for _, label in pairs(knownPlayers) do
+            table.insert(whitelistValues, label)
+        end
+
+        table.sort(whitelistValues)
+
+        local inviteValues = {}
+        local now = os.clock()
+
+        for userId, invitation in pairs(invitations) do
+            if invitation.Expires <= now then
+                invitations[userId] = nil
+            else
+                labelToId[invitation.Label] = userId
+                table.insert(inviteValues, invitation.Label)
+            end
+        end
+
+        table.sort(inviteValues)
+
+        if playerDropdown then
+            playerDropdown:SetValues(onlineValues)
+        end
+
+        if memberDropdown then
+            memberDropdown:SetValues(memberValues)
+        end
+
+        if whitelistDropdown then
+            whitelistDropdown:SetValues(whitelistValues)
+        end
+
+        if inviteDropdown then
+            inviteDropdown:SetValues(inviteValues)
+        end
+    end
+
+    local function CanInvite(userId)
+        local party = LocalParty()
+
+        if not IsLeader() then return false end
+        if #party.Members >= maxMembers then return false end
+        if userId == LocalPlayer.UserId then return false end
+        if IsMember(party, userId) then return false end
+
+        local player = Players:GetPlayerByUserId(userId)
+
+        return player ~= nil and partyCache[userId] == false
+    end
+
+    local function Invite(userId)
+        if not userId or not CanInvite(userId) then
+            return false
+        end
+
+        if Send("invite", userId) then
+            lastInvite[userId] = os.clock()
+            return true
+        end
+
+        return false
+    end
+
+    local function RespondInvite(userId, accept)
+        local invitation = userId and invitations[userId]
+
+        if not invitation
+            or invitation.Expires <= os.clock() then
+            Report("คำเชิญหมดอายุหรือยังไม่ได้รับคำเชิญ")
+            return false
+        end
+
+        if accept and LocalParty() ~= false then
+            Report("ต้องไม่มีปาร์ตี้ก่อนรับคำเชิญ")
+            return false
+        end
+
+        if Send(accept and "accept" or "decline", userId) then
+            invitations[userId] = nil
+            Refresh()
+            return true
+        end
+
+        return false
+    end
+
+    management:AddButton({
+        Title = "Create Party",
+        Description = "สร้างปาร์ตี้เมื่อยังไม่ได้อยู่ในปาร์ตี้",
+        Callback = function()
+            if LocalParty() == false then
+                Send("create")
+            else
+                Report("มีปาร์ตี้อยู่แล้ว หรือข้อมูลยังไม่พร้อม")
+            end
+        end,
+    })
+
+    management:AddButton({
+        Title = "Leave Party",
+        Description = "ออกจากปาร์ตี้ปัจจุบัน "
+            .. "หัวหน้าปาร์ตี้อาจถูกโอนโดยระบบเกม",
+        Callback = function()
+            if type(LocalParty()) == "table" then
+                Send("leave")
+            end
+        end,
+    })
+
+    management:AddDropdown("ZeroXPartyLootMode", {
+        Title = "Loot Mode",
+        Description = "เลือก share เพื่อแบ่งของ หรือ owner "
+            .. "ตามสิทธิ์เจ้าของ แล้วกด Apply Loot Mode",
+        Values = { "share", "owner" },
+        Default = "owner",
+    })
+
+    management:AddButton({
+        Title = "Apply Loot Mode",
+        Description = "ใช้โหมดแบ่งของที่เลือก เฉพาะหัวหน้าปาร์ตี้",
+        Callback = function()
+            if not IsLeader() then
+                Report("เปลี่ยนโหมดได้เฉพาะหัวหน้าปาร์ตี้")
+                return
+            end
+
+            local option = Options.ZeroXPartyLootMode
+            local value = option and option.Value
+
+            if value == "share" or value == "owner" then
+                Send("lootmode", value)
+            end
+        end,
+    })
+
+    playerDropdown = inviteSection:AddDropdown(
+        "ZeroXPartyPlayer", {
+            Title = "Select Player",
+            Description = "เลือกผู้เล่นในเซิร์ฟเวอร์เพื่อเชิญ",
+            Values = {},
+            AllowNull = true,
+            Searchable = true,
+            Callback = function(value)
+                selectedPlayer = labelToId[value]
+            end,
+        }
+    )
+
+    inviteSection:AddButton({
+        Title = "Invite Player",
+        Description = "เชิญคนที่เลือก ต้องเป็นหัวหน้า "
+            .. "และปาร์ตี้ยังไม่เต็ม",
+        Callback = function()
+            if not Invite(selectedPlayer) then
+                Report("เชิญไม่ได้: ตรวจผู้เล่น หัวหน้าปาร์ตี้ "
+                    .. "จำนวนสมาชิก หรือรอส่งคำสั่งรอบถัดไป")
+            end
+        end,
+    })
+
+    memberDropdown = memberSection:AddDropdown(
+        "ZeroXPartyMember", {
+            Title = "Select Member",
+            Description = "เลือกสมาชิกเพื่อจัดการสิทธิ์",
+            Values = {},
+            AllowNull = true,
+            Searchable = true,
+            Callback = function(value)
+                selectedMember = labelToId[value]
+                promotion = nil
+            end,
+        }
+    )
+
+    local function CanManageMember()
+        return selectedMember ~= nil
+            and selectedMember ~= LocalPlayer.UserId
+            and IsLeader()
+            and IsMember(LocalParty(), selectedMember)
+    end
+
+    memberSection:AddButton({
+        Title = "Kick Member",
+        Description = "นำสมาชิกที่เลือกออกจากปาร์ตี้ "
+            .. "ใช้ได้เฉพาะหัวหน้า",
+        Callback = function()
+            if CanManageMember() then
+                Send("kick", selectedMember)
+            else
+                Report("ต้องเป็นหัวหน้าและเลือกสมาชิกปัจจุบัน")
+            end
+        end,
+    })
+
+    memberSection:AddButton({
+        Title = "Transfer Leader",
+        Description = "กดครั้งแรกเพื่อเตรียมโอน "
+            .. "แล้วกดซ้ำภายใน 4 วินาทีเพื่อยืนยัน",
+        Callback = function()
+            if not CanManageMember() then
+                promotion = nil
+                Report("ต้องเป็นหัวหน้าและเลือกสมาชิกปัจจุบัน")
+                return
+            end
+
+            local now = os.clock()
+
+            if promotion
+                and promotion.UserId == selectedMember
+                and now <= promotion.Expires then
+
+                if Send("leader", selectedMember) then
+                    promotion = nil
+                end
+                return
+            end
+
+            promotion = {
+                UserId = selectedMember,
+                Expires = now + 4,
+            }
+
+            Report("กด Transfer Leader ซ้ำภายใน 4 วินาที")
+        end,
+    })
+
+    whitelistDropdown = automation:AddDropdown(
+        "ZeroXPartyWhitelist", {
+            Title = "Selected Players",
+            Description = "รายชื่อสำหรับ Auto Invite และ Auto Accept "
+                .. "เลือกได้หลายคน",
+            Values = {},
+            Multi = true,
+            Searchable = true,
+            Callback = function(values)
+                whitelist = {}
+
+                if type(values) ~= "table" then return end
+
+                for label, selected in pairs(values) do
+                    local userId = labelToId[label]
+
+                    if selected == true and userId then
+                        whitelist[userId] = true
+                    end
+                end
+            end,
+        }
+    )
+
+    automation:AddToggle("ZeroXPartyAutoInvite", {
+        Title = "Auto Invite",
+        Description = "เชิญเฉพาะคนที่เลือก ข้ามคนที่มีปาร์ตี้แล้ว "
+            .. "และหยุดเมื่อเต็ม ต้องสร้างปาร์ตี้ก่อน",
+        Default = false,
+        Callback = function(value)
+            autoInvite = value == true
+        end,
+    })
+
+    automation:AddDropdown("ZeroXPartyInviteRetry", {
+        Title = "Invite Retry",
+        Description = "ระยะเวลาส่งคำเชิญซ้ำต่อคน หน่วยวินาที "
+            .. "เป็นค่าที่สคริปต์กำหนดเอง",
+        Values = { "60", "120", "180", "300" },
+        Default = "60",
+        Callback = function(value)
+            retrySeconds = tonumber(value) or 60
+        end,
+    })
+
+    automation:AddToggle("ZeroXPartyAutoAccept", {
+        Title = "Auto Accept",
+        Description = "รับเฉพาะคำเชิญจากคนที่เลือก "
+            .. "คำเชิญจากคนอื่นยังให้ตัดสินใจเอง",
+        Default = false,
+        Callback = function(value)
+            autoAccept = value == true
+        end,
+    })
+
+    automation:AddToggle("ZeroXPartyAutoInviteAll", {
+        Title = "Auto Invite All",
+        Description = "เชิญใครก็ได้ในเซิร์ฟเวอร์ที่ยังไม่มีปาร์ตี้ "
+            .. "ต้องเป็นหัวหน้า หยุดเมื่อเต็ม "
+            .. "และใช้ระยะส่งซ้ำตาม Invite Retry",
+        Default = false,
+        Callback = function(value)
+            autoInviteAll = value == true
+        end,
+    })
+
+    automation:AddToggle("ZeroXPartyAutoAcceptAll", {
+        Title = "Auto Accept All",
+        Description = "รับคำเชิญจากใครก็ได้ "
+            .. "ทำงานเมื่อเรายังไม่มีปาร์ตี้และคำเชิญยังไม่หมดอายุ",
+        Default = false,
+        Callback = function(value)
+            autoAcceptAll = value == true
+        end,
+    })
+
+    local function WatchPlayer(player)
+        local userId = player.UserId
+
+        if playerConnections[userId] then return end
+
+        partyCache[userId] = ReadParty(player)
+
+        if player ~= LocalPlayer then
+            local label = PlayerLabel(player)
+            knownPlayers[userId] = label
+            labelToId[label] = userId
+        end
+
+        playerConnections[userId] =
+            player:GetAttributeChangedSignal("PartyJson"):Connect(
+                function()
+                    if not active then return end
+
+                    partyCache[userId] = ReadParty(player)
+
+                    if player == LocalPlayer then
+                        promotion = nil
+
+                        if type(LocalParty()) == "table" then
+                            table.clear(invitations)
+                        end
+                    end
+
+                    Refresh()
+                end
+            )
+    end
+
+    Connect(Players.PlayerAdded, function(player)
+        WatchPlayer(player)
+        Refresh()
+    end)
+
+    Connect(Players.PlayerRemoving, function(player)
+        local userId = player.UserId
+        local connection = playerConnections[userId]
+
+        if connection then connection:Disconnect() end
+
+        playerConnections[userId] = nil
+        partyCache[userId] = nil
+        invitations[userId] = nil
+        lastInvite[userId] = nil
+
+        -- PlayerRemoving อาจเกิดก่อน GetPlayers ลบผู้เล่น
+        task.defer(function()
+            if active then Refresh() end
+        end)
+    end)
+
+    for _, player in ipairs(Players:GetPlayers()) do
+        WatchPlayer(player)
+    end
+
+    local watchedInviteRemote
+    local inviteConnection
+
+    local function BindInviteRemote()
+        local remotes = RS:FindFirstChild("Remotes")
+        local remote = remotes
+            and remotes:FindFirstChild("PartyInvite")
+
+        if remote and not remote:IsA("RemoteEvent") then
+            remote = nil
+        end
+
+        if remote == watchedInviteRemote then return end
+
+        if inviteConnection then
+            inviteConnection:Disconnect()
+            inviteConnection = nil
+        end
+
+        watchedInviteRemote = remote
+
+        if remote then
+            inviteConnection = remote.OnClientEvent:Connect(
+                function(userId, senderName, expirySeconds)
+                    if not active
+                        or not FiniteNumber(userId)
+                        or userId <= 0 or userId % 1 ~= 0
+                        or type(senderName) ~= "string" then
+                        return
+                    end
+
+                    if expirySeconds == nil then
+                        expirySeconds = 60
+                    end
+
+                    if not FiniteNumber(expirySeconds)
+                        or expirySeconds <= 0 then
+                        return
+                    end
+
+                    local label = string.format(
+                        "%s [%d]", senderName, userId
+                    )
+
+                    invitations[userId] = {
+                        Label = label,
+                        Expires = os.clock() + expirySeconds,
+                    }
+
+                    Refresh()
+                end
+            )
+        end
+    end
+
+    Refresh()
+    BindInviteRemote()
+
+    MacUI:OnUnload(function()
+        active = false
+
+        if inviteConnection then
+            inviteConnection:Disconnect()
+        end
+
+        for _, connection in ipairs(connections) do
+            connection:Disconnect()
+        end
+
+        for _, connection in pairs(playerConnections) do
+            connection:Disconnect()
+        end
+
+        table.clear(connections)
+        table.clear(playerConnections)
+        table.clear(invitations)
+    end)
+
+    task.spawn(function()
+        while active do
+            task.wait(1)
+            if not active then break end
+
+            BindInviteRemote()
+
+            local now = os.clock()
+            local changed = false
+
+            for userId, invitation in pairs(invitations) do
+                if invitation.Expires <= now then
+                    invitations[userId] = nil
+                    changed = true
+                end
+            end
+
+            if changed then Refresh() end
+
+            local accepted = false
+
+            if (autoAccept or autoAcceptAll)
+                and LocalParty() == false then
+
+                for userId in pairs(invitations) do
+                    if autoAcceptAll or whitelist[userId] then
+                        accepted = RespondInvite(userId, true)
+                        if accepted then break end
+                    end
+                end
+            end
+
+            if not accepted
+                and (autoInvite or autoInviteAll)
+                and IsLeader() then
+
+                local candidates = {}
+
+                if autoInviteAll then
+                    for _, player in ipairs(Players:GetPlayers()) do
+                        if CanInvite(player.UserId) then
+                            table.insert(candidates, player.UserId)
+                        end
+                    end
+                else
+                    for userId in pairs(whitelist) do
+                        if CanInvite(userId) then
+                            table.insert(candidates, userId)
+                        end
+                    end
+                end
+
+                table.sort(candidates)
+
+                for offset = 1, #candidates do
+                    local index =
+                        ((inviteCursor + offset - 1)
+                            % #candidates) + 1
+
+                    local userId = candidates[index]
+
+                    if now - (lastInvite[userId] or -math.huge)
+                        >= retrySeconds then
+                        if Invite(userId) then
+                            inviteCursor = index
+                            break
+                        end
+                    end
+                end
+            end
+        end
+    end)
+end
 
 
 --------------------------------------------------------------------------------
@@ -590,6 +1373,8 @@ do
         local farmTravelActive = false
         local dropTripActive = false
         local chestTripActive = false
+        local bossDodgeActive = false
+        local ResetBossDodge
         local sellTripActive = false
         local pullEnabled = false
         local farmPullActive = false
@@ -626,6 +1411,7 @@ do
         local RANGE_MARGIN = 0.75
         local REPOSITION_DISTANCE = 0.75
         local WAIT_HEIGHT = 4
+        local FARM_HOVER_HEIGHT = 30
 
         local FarmTab = Tabs.AutoFarm
         local ShopTab = Tabs.Shop
@@ -855,6 +1641,10 @@ do
         end
 
         local function ClearTarget()
+            if ResetBossDodge then
+                ResetBossDodge(true)
+            end
+
             farmSideTarget = nil
             farmSideRoot = nil
             farmSideDirection = nil
@@ -1362,6 +2152,13 @@ do
                 farmPullActive = true
                 ClearTarget()
 
+                HoldFarmPosition(
+                    humanoid,
+                    root,
+                    root.Position,
+                    root.CFrame
+                )
+
                 if autoOn then
                     menu:Fire("autoToggle")
                 end
@@ -1399,8 +2196,6 @@ do
                 -- ส่งมอนตัวเดิมกลับให้ระบบโจมตี/ลอยหลังเดิม
                 return false, session.MainTarget
             end
-
-            StopFarmHover()
 
             if LocalPlayer:GetAttribute("AutoOn") == true then
                 if now - session.StartedAt >= 5 then
@@ -1461,6 +2256,11 @@ do
                     end
 
                     ClearTarget()
+
+                    HoldFarmPosition(
+                        humanoid, root, root.Position, root.CFrame
+                    )
+
                     session.Index = session.Index + 1
                     session.TargetAt = now
                     session.SentAt = nil
@@ -1484,74 +2284,107 @@ do
                 radius = math.max(radius, 0)
 
                 local attackLimit = range - inside
-                local distance =
-                    (part.Position - root.Position).Magnitude - radius
+                local reach = math.max(
+                    0.5,
+                    attackLimit + radius - RANGE_MARGIN
+                )
 
-                if not session.SentAt then
-                    if distance > attackLimit then
-                        -- วาปเข้าหาแต่ละตัวครั้งเดียว
-                        -- หากถูกดึงกลับ ให้ Timeout เดิมข้ามตัวนี้
-                        if session.WarpedIndex == session.Index then
-                            SetStatus("Pull: waiting for attack range")
-                            return true
-                        end
+                -- ล็อกทิศด้านหลังครั้งแรกของมอนแต่ละตัว
+                -- ไม่หมุนไล่ตามการหันของมอน
+                if session.HoverIndex ~= session.Index
+                    or not session.HoverDirection then
 
-                        local delta = root.Position - part.Position
-                        local horizontal = Vector3.new(delta.X, 0, delta.Z)
+                    local look = part.CFrame.LookVector
+                    local direction =
+                        Vector3.new(-look.X, 0, -look.Z)
 
-                        local direction = horizontal.Magnitude > 0.01
-                            and horizontal.Unit or Vector3.zAxis
-
-                        local standDistance = math.min(
-                            4,
-                            math.max(
-                                0.5,
-                                attackLimit + radius - RANGE_MARGIN
-                            )
-                        )
-
-                        local destination =
-                            part.Position + direction * standDistance
-
-                        if not InsidePullZone(session.Zone, destination)
-                            or (destination - session.Anchor).Magnitude
-                                > PULL_RADIUS + 15 then
-
-                            ClearTarget()
-                            session.Index = session.Index + 1
-                            session.TargetAt = now
-                            session.SentAt = nil
-                            return true
-                        end
-
-                        humanoid:Move(Vector3.zero, false)
-                        root.CFrame = CFrame.lookAt(
-                            destination,
-                            part.Position
-                        )
-                        root.AssemblyLinearVelocity = Vector3.zero
-                        root.AssemblyAngularVelocity = Vector3.zero
-
-                        session.WarpedIndex = session.Index
-
-                        SetStatus(string.format(
-                            "Pull: warped to %d/%d",
-                            session.Index,
-                            #session.Queue
-                        ))
-
-                        -- ตรวจระยะอีกครั้งในรอบหน้า ก่อนส่งโจมตี
+                    if direction.Magnitude <= 0.01 then
+                        SetStatus("Pull: waiting for monster facing")
                         return true
                     end
 
-                    humanoid:Move(Vector3.zero, false)
+                    session.HoverIndex = session.Index
+                    session.HoverDirection = direction.Unit
+                end
 
+                local height = math.min(
+                    FARM_HOVER_HEIGHT,
+                    reach * 0.4
+                )
+
+                local horizontalDistance = math.sqrt(
+                    math.max(0, reach * reach - height * height)
+                )
+
+                local destination = part.Position
+                    + session.HoverDirection * horizontalDistance
+                    + Vector3.new(0, height, 0)
+
+                -- คงข้อจำกัดโซนและระยะลากเดิม
+                if not InsidePullZone(session.Zone, destination)
+                    or (destination - session.Anchor).Magnitude
+                        > PULL_RADIUS + 15 then
+
+                    ClearTarget()
+
+                    HoldFarmPosition(
+                        humanoid, root, root.Position, root.CFrame
+                    )
+
+                    session.Index += 1
+                    session.TargetAt = now
+                    session.SentAt = nil
+                    session.HitObserved = false
+                    return true
+                end
+
+                local facing = CFrame.lookAt(
+                    destination,
+                    Vector3.new(
+                        part.Position.X,
+                        destination.Y,
+                        part.Position.Z
+                    )
+                )
+
+                -- ClearTarget ลบ Hover จึงเรียกก่อนติดตั้ง Hover ใหม่
+                if not session.SentAt and target ~= model then
+                    ClearTarget()
+                end
+
+                humanoid:Move(Vector3.zero, false)
+
+                local distance =
+                    (part.Position - root.Position).Magnitude - radius
+
+                if distance > attackLimit
+                    or (root.Position - destination).Magnitude
+                        > REPOSITION_DISTANCE then
+
+                    root.CFrame = facing
+                    root.AssemblyLinearVelocity = Vector3.zero
+                    root.AssemblyAngularVelocity = Vector3.zero
+                end
+
+                HoldFarmPosition(
+                    humanoid, root, destination, facing
+                )
+
+                session.HoverPosition = destination
+                session.HoverFacing = facing
+
+                -- ตรวจระยะจริงหลังจัดตำแหน่ง
+                distance =
+                    (part.Position - root.Position).Magnitude - radius
+
+                if distance > attackLimit then
+                    SetStatus("Pull: hovering; waiting for attack range")
+                    return true
+                end
+
+                if not session.SentAt then
                     local tracker = GetTracker()
                     if not tracker then return true end
-
-                    if target ~= model then
-                        ClearTarget()
-                    end
 
                     local beforeHP =
                         tonumber(model:GetAttribute("HP"))
@@ -1592,8 +2425,22 @@ do
                                     session.HitConnection = nil
                                 end
 
-                                -- หยุดโจมตีทันทีเมื่อสังเกต HP ลดครั้งแรก
+                                -- หยุดตี แต่คงตำแหน่งลอยระหว่างเปลี่ยนตัว
                                 ClearTarget()
+
+                                if root.Parent and humanoid.Health > 0
+                                    and LocalPlayer.Character == character
+                                    and farmPullActive
+                                    and session.HoverPosition
+                                    and session.HoverFacing then
+
+                                    HoldFarmPosition(
+                                        humanoid,
+                                        root,
+                                        session.HoverPosition,
+                                        session.HoverFacing
+                                    )
+                                end
                             end
                         end)
 
@@ -1875,6 +2722,699 @@ do
             FinishFarmTravel(false)
         end)
 
+        local dodgeEnabled = false
+        local dodgeEvents = {}
+        local dodgeSession
+
+        -- ไม่สร้างป้าย Debug บนหน้า Auto Farm
+        local hiddenDodgeStatus = {
+            SetValue = function() end,
+        }
+
+        local dodgeStatus = hiddenDodgeStatus
+        local dodgeSkillStatus = hiddenDodgeStatus
+        local dodgeCheckStatus = hiddenDodgeStatus
+        local dodgeDataStatus = hiddenDodgeStatus
+
+        -- ขอบพื้นที่ที่ตรวจยืนยันแล้ว อิงศูนย์กลาง Floor ที่โหลดจริง
+        -- เว้นขอบเพิ่มอีก 2 studs ในขั้นตอนเลือกจุด
+        local dodgeRooms = {
+            Boss01 = { Floor = "Base", HalfX = 65, HalfZ = 49 },
+            Boss02 = { Floor = "Dirt", HalfX = 65, HalfZ = 50 },
+            Boss03 = { Floor = "Base", HalfX = 65, HalfZ = 49 },
+            Boss04 = { Floor = "Base", HalfX = 65, HalfZ = 49 },
+        }
+
+        local DODGE_MARGIN = 2
+        local DODGE_GRID = 8
+        local DODGE_SETTLE = 0.5 -- เผื่อรอคลื่นถัดไป ไม่ใช่เวลา Damage
+
+        local function NumberOK(value)
+            return type(value) == "number"
+                and value == value
+                and math.abs(value) < math.huge
+        end
+
+        local function Flat(vector)
+            return Vector3.new(vector.X, 0, vector.Z)
+        end
+
+        local function ProgressionGate(model)
+            local id = model:GetAttribute("MonsterId")
+
+            for _, requirement in ipairs(requirements) do
+                if requirement.MonsterId == id then
+                    return requirement.GateId
+                end
+            end
+
+            return nil
+        end
+
+        ResetBossDodge = function(restoreAuto)
+            local old = dodgeSession
+            dodgeSession = nil
+            bossDodgeActive = false
+            table.clear(dodgeEvents)
+
+            if not old then return end
+
+            local bossPart = old.Boss
+                and GetMonsterPart(old.Boss)
+
+            if bossPart and old.Boss == target
+                and old.Character == LocalPlayer.Character
+                and old.Root and old.Root.Parent then
+
+                local direction = Flat(
+                    old.Root.Position - bossPart.Position
+                )
+
+                if direction.Magnitude > 0.01 then
+                    farmSideTarget = target
+                    farmSideRoot = old.Root
+                    farmSideDirection = direction.Unit
+                end
+            end
+
+            StopFarmHover()
+            holding = false
+
+            if restoreAuto and alive
+                and old.Character == LocalPlayer.Character
+                and old.Humanoid.Parent
+                and old.Humanoid.Health > 0
+                and old.AutoWasOn
+                and not potionTripActive
+                and not sellTripActive
+                and not dropTripActive
+                and not chestTripActive
+                and not farmTravelActive then
+
+                local menu = LocalPlayer:FindFirstChild("LumiMenuToggle")
+                if menu and menu:IsA("BindableEvent")
+                    and LocalPlayer:GetAttribute("AutoOn") ~= true then
+                    menu:Fire("autoToggle")
+                end
+            end
+        end
+
+        -- คืน true = จุดอยู่ในรูปทรง
+        -- คืน nil = ข้อมูลรูปทรงไม่ครบ ห้ามเดาจุดหลบ
+        local function InsideAttack(zone, position, margin, inner)
+            if zone.Safe == true
+                or zone.Kind == "circle" then
+
+                if typeof(zone.Center) ~= "Vector3"
+                    or not NumberOK(zone.Radius) then
+                    return nil
+                end
+
+                local distance =
+                    Flat(position - zone.Center).Magnitude
+
+                if zone.Safe == true then
+                    return distance <= math.max(
+                        0, zone.Radius - margin
+                    )
+                end
+
+                if inner ~= nil then
+                    if not NumberOK(inner) then return nil end
+
+                    return distance >= math.max(0, inner - margin)
+                        and distance <= zone.Radius + margin
+                end
+
+                return distance <= zone.Radius + margin
+            end
+
+            if zone.Kind == "cone" then
+                if typeof(zone.Center) ~= "Vector3"
+                    or typeof(zone.Dir) ~= "Vector3"
+                    or not NumberOK(zone.Radius)
+                    or not NumberOK(zone.Half) then
+                    return nil
+                end
+
+                local offset = Flat(position - zone.Center)
+                local direction = Flat(zone.Dir)
+                local distance = offset.Magnitude
+
+                if direction.Magnitude <= 0.001 then return nil end
+                if distance > zone.Radius + margin then return false end
+                if distance <= margin then return true end
+
+                local extra = math.asin(
+                    math.clamp(margin / distance, 0, 1)
+                )
+
+                local angle = math.acos(math.clamp(
+                    direction.Unit:Dot(offset.Unit), -1, 1
+                ))
+
+                return angle <= zone.Half + extra
+            end
+
+            -- รองรับพื้นที่สี่เหลี่ยมตามข้อมูลที่ Native ใช้วาดจริง
+            if zone.Room == true
+                or zone.Kind == "room"
+                or zone.Kind == "line"
+                or zone.Kind == "charge"
+                or zone.Kind == "cross"
+                or (
+                    typeof(zone.CFrame) == "CFrame"
+                    and NumberOK(zone.Width)
+                    and NumberOK(zone.Length)
+                ) then
+
+                if typeof(zone.CFrame) ~= "CFrame"
+                    or not NumberOK(zone.Width)
+                    or not NumberOK(zone.Length) then
+                    return nil
+                end
+
+                -- ตัดความสูงออกก่อนแปลงพิกัด
+                local point = Vector3.new(
+                    position.X,
+                    zone.CFrame.Position.Y,
+                    position.Z
+                )
+                local relative =
+                    zone.CFrame:PointToObjectSpace(point)
+
+                return math.abs(relative.X)
+                        <= zone.Width / 2 + margin
+                    and math.abs(relative.Z)
+                        <= zone.Length / 2 + margin
+            end
+
+            return nil
+        end
+
+        local function PointAllowed(position)
+            for _, event in ipairs(dodgeEvents) do
+                local inSafe = false
+
+                for _, zone in ipairs(event.Zones) do
+                    if zone.Safe == true then
+                        local inside = InsideAttack(
+                            zone, position, DODGE_MARGIN
+                        )
+                        if inside == nil then return false end
+                        if inside then inSafe = true end
+                    end
+                end
+
+                for _, zone in ipairs(event.Zones) do
+                    if zone.Safe ~= true then
+                        local inside = InsideAttack(
+                            zone, position, DODGE_MARGIN,
+                            event.Inner
+                        )
+
+                        if inside == nil then return false end
+
+                        if inside then
+                            -- วงเขียวยกเว้นเฉพาะพื้นโจมตีทั้งห้อง
+                            local room = zone.Room == true
+                                or zone.Kind == "room"
+
+                            if not room or not inSafe then
+                                return false
+                            end
+                        end
+                    end
+                end
+            end
+
+            return true
+        end
+
+        local bossFx = FindRequired(remotes, "BossFx", "RemoteEvent")
+
+        if bossFx then
+            Connect(bossFx.OnClientEvent, function(
+                action, bossName, skillName, zonesData, duration
+            )
+                if not alive or not enabled or not dodgeEnabled
+                    or not target or not GetMonsterPart(target)
+                    or mode ~= "Farm Level"
+                    or potionTripActive or sellTripActive
+                    or dropTripActive or chestTripActive
+                    or farmTravelActive then
+                    return
+                end
+
+                local gate = ProgressionGate(target)
+                if not gate or not dodgeRooms[gate] then return end
+
+                local id = target:GetAttribute("MonsterId")
+                local def = monsterData[id]
+                local name = target:GetAttribute("DisplayName")
+                    or (type(def) == "table" and def.Name)
+
+                if bossName ~= name or type(skillName) ~= "string" then
+                    return
+                end
+
+                -- Remote มีแค่ชื่อ จึงไม่ใช้เมื่อมีผู้ร่ายชื่อเดียวกันหลายตัว
+                local matching = 0
+                for model in pairs(monsters) do
+                    local modelId = model:GetAttribute("MonsterId")
+                    local modelDef = monsterData[modelId]
+                    local modelName = model:GetAttribute("DisplayName")
+                        or (type(modelDef) == "table" and modelDef.Name)
+
+                    if modelName == bossName and GetMonsterPart(model) then
+                        matching += 1
+                    end
+                end
+                if matching ~= 1 then return end
+
+                local key = bossName .. "|" .. skillName
+                local now = os.clock()
+
+                if action == "cancel" then
+                    for index = #dodgeEvents, 1, -1 do
+                        local event = dodgeEvents[index]
+                        if event.Key == key and not event.Hit then
+                            table.remove(dodgeEvents, index)
+                        end
+                    end
+                    return
+                end
+
+                if action == "hit" then
+                    if not NumberOK(duration) or duration < 0 then return end
+
+                    for _, event in ipairs(dodgeEvents) do
+                        if event.Key == key and not event.Hit then
+                            event.Hit = true
+                            event.Expires = now
+                                + math.max(DODGE_SETTLE, duration)
+                            break
+                        end
+                    end
+                    return
+                end
+
+                if action ~= "warn"
+                    or type(zonesData) ~= "table"
+                    or not NumberOK(duration) or duration < 0 then
+                    return
+                end
+
+                local function FindMove(moves)
+                    if type(moves) ~= "table" then return nil end
+
+                    for _, candidate in pairs(moves) do
+                        if type(candidate) == "table"
+                            and candidate.Name == skillName then
+                            return candidate
+                        end
+                    end
+
+                    return nil
+                end
+
+                local skill
+
+                if type(def) == "table" then
+                    skill = FindMove(def.Skills)
+                        or FindMove(def.LeaderMoves)
+                end
+
+                if not skill then
+                    dodgeStatus:SetValue(
+                        "ไม่พบสกิลใน Skills / LeaderMoves: "
+                            .. skillName
+                    )
+                    return
+                end
+
+                if skill.Pool then
+                    dodgeStatus:SetValue(
+                        "ยังไม่รองรับพื้นค้าง: " .. skillName
+                    )
+                    return
+                end
+
+                if skill.Shape == "spin" then
+                    dodgeStatus:SetValue(
+                        "ยังไม่รองรับ Spin: " .. skillName
+                    )
+                    return
+                end
+
+                local snapshot = {}
+                for _, zone in ipairs(zonesData) do
+                    if type(zone) ~= "table" then return end
+                    table.insert(snapshot, table.clone(zone))
+                end
+                if #snapshot == 0 then return end
+
+                table.insert(dodgeEvents, {
+                    Boss = target,
+                    Key = key,
+                    Zones = snapshot,
+                    Inner = skill.Shape == "donut" and skill.Inner or nil,
+                    Expires = now + duration + DODGE_SETTLE,
+                })
+            end)
+        end
+
+        local function StepBossDodge(
+            gate, model, character, humanoid, root
+        )
+            if not dodgeEnabled or not gate or not dodgeRooms[gate] then
+                if bossDodgeActive then ResetBossDodge(true) end
+                return false
+            end
+
+            local now = os.clock()
+            for index = #dodgeEvents, 1, -1 do
+                local event = dodgeEvents[index]
+                if event.Boss ~= model
+                    or (event.Hit and now >= event.Expires) then
+                    table.remove(dodgeEvents, index)
+                end
+            end
+
+            if #dodgeEvents == 0 then
+                if bossDodgeActive then
+                    ResetBossDodge(true)
+                    dodgeStatus:SetValue("พ้นช่วงหลบ กลับไปโจมตี")
+                end
+                return false
+            end
+
+            if not dodgeSession then
+                dodgeSession = {
+                    Character = character,
+                    Humanoid = humanoid,
+                    Boss = model,
+                    Root = root,
+                    AutoWasOn =
+                        LocalPlayer:GetAttribute("AutoOn") == true,
+                }
+
+                bossDodgeActive = true
+                StopFarmHover()
+                holding = false
+                setTarget:FireServer(nil, false)
+
+                local menu = LocalPlayer:FindFirstChild("LumiMenuToggle")
+                if LocalPlayer:GetAttribute("AutoOn") == true
+                    and menu and menu:IsA("BindableEvent") then
+                    menu:Fire("autoToggle")
+                end
+            end
+
+            if LocalPlayer:GetAttribute("AutoOn") == true then
+                dodgeStatus:SetValue("รอ Native Auto หยุด")
+                return true
+            end
+
+            local status = character:GetAttribute("StatusList")
+            if type(status) == "string" then
+                for token in status:lower():gmatch("[^,%s]+") do
+                    if token == "stun" or token == "freeze" then
+                        StopFarmHover()
+                        dodgeStatus:SetValue("ติด Stun / Freeze")
+                        return true
+                    end
+                end
+            end
+
+            local map = workspace:FindFirstChild("Map")
+            local chunks = map and map:FindFirstChild("BlockFields")
+            local chunk = chunks and chunks:FindFirstChild(gate)
+            local island = chunk and chunk:FindFirstChild("Island")
+            local bounds = dodgeRooms[gate]
+            local floor = island and island:FindFirstChild(bounds.Floor)
+
+            if not floor or not floor:IsA("BasePart") then
+                StopFarmHover()
+                dodgeStatus:SetValue("รอพื้นที่ห้องบอสโหลด")
+                return true
+            end
+
+            local function InBounds(point)
+                local relative = floor.CFrame:PointToObjectSpace(point)
+                return math.abs(relative.X) <= bounds.HalfX - DODGE_MARGIN
+                    and math.abs(relative.Z)
+                        <= bounds.HalfZ - DODGE_MARGIN
+            end
+
+            local rayParams = RaycastParams.new()
+            rayParams.FilterType = Enum.RaycastFilterType.Include
+            rayParams.FilterDescendantsInstances = { island }
+            rayParams.RespectCanCollide = true
+
+            local rejected = {
+                Bounds = 0,
+                Hazard = 0,
+                Floor = 0,
+                Data = 0,
+            }
+
+            local skillNames = {}
+            local seenNames = {}
+            local geometryOK = true
+            local dataIssue
+
+            for _, event in ipairs(dodgeEvents) do
+                local name = event.Key:match("%|(.*)$") or event.Key
+
+                if not seenNames[name] then
+                    seenNames[name] = true
+                    table.insert(skillNames, name)
+                end
+
+                for _, zone in ipairs(event.Zones) do
+                    if InsideAttack(
+                        zone, root.Position, DODGE_MARGIN, event.Inner
+                    ) == nil then
+                        geometryOK = false
+
+                        if not dataIssue then
+                            dataIssue = string.format(
+                                "%s | Kind=%s CF=%s W=%s L=%s",
+                                name,
+                                tostring(zone.Kind),
+                                typeof(zone.CFrame),
+                                tostring(zone.Width),
+                                tostring(zone.Length)
+                            )
+                        end
+                    end
+                end
+            end
+
+            dodgeSkillStatus:SetValue(table.concat(skillNames, ", "))
+            dodgeDataStatus:SetValue(
+                dataIssue or "อ่านรูปทรงพื้นที่โจมตีได้"
+            )
+
+            local function ValidPoint(point)
+                if not geometryOK then
+                    rejected.Data += 1
+                    return false
+                end
+
+                if not InBounds(point) then
+                    rejected.Bounds += 1
+                    return false
+                end
+
+                if not PointAllowed(point) then
+                    rejected.Hazard += 1
+                    return false
+                end
+
+                local hit = workspace:Raycast(
+                    point + Vector3.new(0, 100, 0),
+                    Vector3.new(0, -500, 0),
+                    rayParams
+                )
+
+                if not hit or hit.Normal.Y <= 0.9 then
+                    rejected.Floor += 1
+                    return false
+                end
+
+                return true
+            end
+
+            local destination = dodgeSession.Point
+
+            if not destination or not ValidPoint(destination) then
+                local candidates = { root.Position }
+
+                -- ใส่ศูนย์กลางวงเขียวโดยตรง ไม่พึ่ง Grid อย่างเดียว
+                for _, event in ipairs(dodgeEvents) do
+                    for _, zone in ipairs(event.Zones) do
+                        if zone.Safe == true
+                            and typeof(zone.Center) == "Vector3" then
+                            table.insert(candidates, Vector3.new(
+                                zone.Center.X,
+                                root.Position.Y,
+                                zone.Center.Z
+                            ))
+
+                            if NumberOK(zone.Radius) then
+                                local usableRadius = math.max(
+                                    0,
+                                    zone.Radius - DODGE_MARGIN - 0.25
+                                )
+
+                                for ring = 1, 3 do
+                                    local radius =
+                                        usableRadius * ring / 3
+
+                                    for index = 0, 15 do
+                                        local angle =
+                                            index * math.pi * 2 / 16
+
+                                        table.insert(
+                                            candidates,
+                                            Vector3.new(
+                                                zone.Center.X
+                                                    + math.cos(angle)
+                                                        * radius,
+                                                root.Position.Y,
+                                                zone.Center.Z
+                                                    + math.sin(angle)
+                                                        * radius
+                                            )
+                                        )
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
+
+                for x = -bounds.HalfX + 4, bounds.HalfX - 4, DODGE_GRID do
+                    for z = -bounds.HalfZ + 4,
+                        bounds.HalfZ - 4, DODGE_GRID do
+
+                        local point = floor.CFrame:PointToWorldSpace(
+                            Vector3.new(x, 0, z)
+                        )
+
+                        table.insert(candidates, Vector3.new(
+                            point.X, root.Position.Y, point.Z
+                        ))
+                    end
+                end
+
+                table.sort(candidates, function(a, b)
+                    return (a - root.Position).Magnitude
+                        < (b - root.Position).Magnitude
+                end)
+
+                destination = nil
+                for _, candidate in ipairs(candidates) do
+                    if ValidPoint(candidate) then
+                        destination = candidate
+                        break
+                    end
+                end
+
+                dodgeSession.Point = destination
+            end
+
+            dodgeCheckStatus:SetValue(string.format(
+                "Bounds:%d Hazard:%d Floor:%d Data:%d",
+                rejected.Bounds,
+                rejected.Hazard,
+                rejected.Floor,
+                rejected.Data
+            ))
+
+            if not destination then
+                StopFarmHover()
+                dodgeStatus:SetValue(
+                    "ไม่พบจุดผ่านเงื่อนไข ไม่วาปสุ่ม"
+                )
+                return true
+            end
+
+            local facing = CFrame.new(destination) * root.CFrame.Rotation
+
+            humanoid:Move(Vector3.zero, false)
+
+            local applied = dodgeSession.AppliedPoint
+
+            if not applied
+                or Flat(destination - applied).Magnitude > 0.5 then
+
+                root.CFrame = facing
+                root.AssemblyLinearVelocity = Vector3.zero
+                root.AssemblyAngularVelocity = Vector3.zero
+
+                dodgeSession.AppliedPoint = destination
+            end
+
+            HoldFarmPosition(humanoid, root, destination, facing)
+
+            if InBounds(root.Position)
+                and PointAllowed(root.Position) then
+                dodgeStatus:SetValue(
+                    "อยู่นอกพื้นที่เตือน รอผลสกิล"
+                )
+            else
+                dodgeStatus:SetValue(
+                    "ตำแหน่งจริงยังไม่พ้นพื้นที่เตือน"
+                )
+            end
+
+            return true
+        end
+
+        combatSection:AddToggle("ZeroXAutoDodgeBossSkill", {
+            Title = "Auto Dodge Skill",
+            Description = "หลบสกิลบอสผ่านโซน Boss01–Boss04 "
+                .. "ตรวจพื้นที่โจมตีและวงเขียวจาก BossFx",
+            Default = false,
+
+            Callback = function(value)
+                dodgeEnabled = value == true
+                ResetBossDodge(true)
+                dodgeStatus:SetValue(
+                    dodgeEnabled and "รอสัญญาณสกิลบอส" or "ปิดใช้งาน"
+                )
+            end,
+        })
+
+        Connect(LocalPlayer.CharacterRemoving, function()
+            ResetBossDodge(false)
+        end)
+
+        local function InDodgeRoom(gate, position)
+            local bounds = dodgeRooms[gate]
+            if not bounds then return false end
+
+            local map = workspace:FindFirstChild("Map")
+            local chunks = map and map:FindFirstChild("BlockFields")
+            local chunk = chunks and chunks:FindFirstChild(gate)
+            local island = chunk and chunk:FindFirstChild("Island")
+            local floor = island and island:FindFirstChild(bounds.Floor)
+
+            if not floor or not floor:IsA("BasePart") then
+                return false
+            end
+
+            local relative = floor.CFrame:PointToObjectSpace(position)
+
+            return math.abs(relative.X)
+                    <= bounds.HalfX - DODGE_MARGIN
+                and math.abs(relative.Z)
+                    <= bounds.HalfZ - DODGE_MARGIN
+        end
+
         local function Step()
             if chestTripActive then
                 SetStatus("Opening chest: farming paused")
@@ -1953,10 +3493,72 @@ do
                 return
             end
 
-            if not StepFarmTravel(
-                zone, level, character, humanoid, root
-            ) then
-                return
+            -- อยู่ในห้องหรือไม่ ไม่ขึ้นกับว่ามี Target แล้วหรือยัง
+            local bossHere = bossGateId ~= nil
+                and InDodgeRoom(bossGateId, root.Position)
+
+            if bossHere then
+                if farmTravel then
+                    FinishFarmTravel(true)
+                end
+
+                local validBoss = target
+                    and ids[target:GetAttribute("MonsterId")]
+                    and GetMonsterPart(target)
+                    and ProgressionGate(target) == bossGateId
+
+                if not validBoss then
+                    ClearTarget()
+
+                    local nearestDistance = math.huge
+
+                    for model in pairs(monsters) do
+                        local id = model:GetAttribute("MonsterId")
+
+                        if ids[id]
+                            and ProgressionGate(model) == bossGateId then
+
+                            local part = GetMonsterPart(model)
+
+                            if part then
+                                local distance =
+                                    (part.Position - root.Position).Magnitude
+
+                                if distance < nearestDistance then
+                                    nearestDistance = distance
+                                    target = model
+                                end
+                            end
+                        end
+                    end
+                end
+
+                if target and GetMonsterPart(target) then
+                    if StepBossDodge(
+                        bossGateId,
+                        target,
+                        character,
+                        humanoid,
+                        root
+                    ) then
+                        return
+                    end
+                else
+                    dodgeStatus:SetValue(
+                        "อยู่ในห้องแล้ว รอ Model บอสโหลดหรือเกิด"
+                    )
+                end
+            else
+                if not StepFarmTravel(
+                    zone, level, character, humanoid, root
+                ) then
+                    if bossGateId then
+                        dodgeStatus:SetValue(
+                            "Travel: กำลังเข้าห้อง " .. bossGateId
+                        )
+                    end
+                    return
+                end
             end
 
             local function Eligible(model)
@@ -2044,6 +3646,12 @@ do
                 return
             end
 
+            if not bossHere and StepBossDodge(
+                bossGateId, target, character, humanoid, root
+            ) then
+                return
+            end
+
             local range = classRange.Attack(LocalPlayer)
             local inside = classRange.StopInside(LocalPlayer)
             local radius = target:GetAttribute("Radius")
@@ -2058,7 +3666,7 @@ do
             if type(radius) ~= "number" then radius = 1.5 end
 
             -- ค่าของระบบใหม่: ความสูงเหนือ Root ของมอน
-            local HOVER_HEIGHT = 30
+            local HOVER_HEIGHT = FARM_HOVER_HEIGHT
 
             -- เลือกด้านหลังครั้งแรกของเป้าหมายนี้
             -- แล้วล็อกเป็นทิศโลก ไม่หมุนตามมอน
@@ -2322,7 +3930,8 @@ do
                 if not alive or not wanted
                     or potionTripActive or farmPullActive
                     or dropTripActive or sellTripActive
-                    or farmTravelActive or chestTripActive then
+                    or farmTravelActive or chestTripActive
+                    or bossDodgeActive then
                     return
                 end
 
@@ -2775,6 +4384,11 @@ do
                 end
 
                 local function PreparePotionTrip(character, humanoid, root)
+                    if bossDodgeActive then
+                        BuyStatus("Waiting for boss dodge")
+                        return false
+                    end
+
                     if chestTripActive then
                         BuyStatus("Waiting for chest collection")
                         return false
@@ -3457,7 +5071,7 @@ do
                     local function CheckDrops()
                         if potionTripActive or sellTripActive
                             or farmPullActive or farmTravelActive
-                            or chestTripActive
+                            or chestTripActive or bossDodgeActive
                             or (Options.ZeroXFly
                                 and Options.ZeroXFly.Value) then
                             FinishDropTrip(true)
@@ -4252,7 +5866,7 @@ do
 
                     if blocked or potionTripActive
                         or dropTripActive or farmTravelActive
-                        or chestTripActive then
+                        or chestTripActive or bossDodgeActive then
                         return
                     end
                     if os.clock() - lastAttempt < interval then return end
@@ -4643,7 +6257,7 @@ do
                 end
 
                 -- ค่านโยบายของสคริปต์
-                local SEARCH_RADIUS = 1000
+                local SEARCH_RADIUS = 120
                 local RESULT_TIMEOUT = 2
                 local RETRY_DELAY = 10
 
@@ -4760,6 +6374,7 @@ do
                 local function CheckChests()
                     if potionTripActive or sellTripActive
                         or dropTripActive or farmTravelActive
+                        or bossDodgeActive
                         or (Options.ZeroXFly
                             and Options.ZeroXFly.Value) then
                         FinishChestTrip(true)
