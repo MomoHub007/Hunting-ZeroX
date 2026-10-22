@@ -501,6 +501,10 @@ local Tabs = {
         Title = "Shop",
         Icon = "shopping-cart",
     }),
+    Event = Window:AddTab({
+        Title = "Event",
+        Icon = "gift",
+    }),
     Player = Window:AddTab({
         Title = "Player",
         Icon = "user",
@@ -580,9 +584,12 @@ do
 
         local alive = true
         local enabled = false
+        local farmRequested = false
+        local pumpkinEnabled = false
         local potionTripActive = false
         local farmTravelActive = false
         local dropTripActive = false
+        local chestTripActive = false
         local sellTripActive = false
         local pullEnabled = false
         local farmPullActive = false
@@ -930,7 +937,118 @@ do
                     or model:GetAttribute("IsBoss"))
         end
 
+        -- จับคู่บอสกิจกรรมกับโซนจากฐานมอนที่ถูกแทนที่
+        local pumpkinZones = {}
+
+        for id, def in pairs(monsterData) do
+            if type(id) == "string"
+                and type(def) == "table"
+                and def.HalloweenPumpkin == true
+                and type(def.PumpkinFrom) == "string" then
+
+                for _, zone in ipairs(zones) do
+                    if zone.Data.BossRoom ~= true
+                        and zone.Ids[def.PumpkinFrom] then
+                        pumpkinZones[id] = zone
+                        break
+                    end
+                end
+            end
+        end
+
+        local function PumpkinCandidate(model, level)
+            local part = GetMonsterPart(model)
+            if not part then return nil end
+
+            local id = model:GetAttribute("MonsterId")
+            local def = type(id) == "string" and monsterData[id]
+            local zone = type(id) == "string" and pumpkinZones[id]
+
+            if type(def) ~= "table"
+                or def.HalloweenPumpkin ~= true
+                or not zone
+                or not CanAccess(zone, level)
+                or not gatesValid then
+                return nil
+            end
+
+            -- ไม่ข้ามประตูบอสที่ยังไม่ผ่าน
+            for _, requirement in ipairs(requirements) do
+                if requirement.Order > zone.Order then break end
+
+                if bossGates[requirement.GateId] ~= true then
+                    return nil
+                end
+            end
+
+            return part, zone, id
+        end
+
+        local function BuildPumpkinPlan(level)
+            -- ตีตัวเดิมต่อจนตายหรือไม่ผ่านเงื่อนไข
+            if target then
+                local part, zone, id = PumpkinCandidate(target, level)
+
+                if part then
+                    return zone, { [id] = true }, nil, nil, target
+                end
+            end
+
+            local character = LocalPlayer.Character
+            local humanoid = character
+                and character:FindFirstChildOfClass("Humanoid")
+            local root = humanoid and humanoid.RootPart
+
+            if not root or not root:IsA("BasePart") then
+                return nil
+            end
+
+            local nearest
+            local nearestZone
+            local nearestId
+            local nearestDistance = math.huge
+
+            -- ใช้รายการ Monsters ที่ระบบเดิม Cache ไว้
+            for model in pairs(monsters) do
+                local part, zone, id = PumpkinCandidate(model, level)
+
+                if part then
+                    local distance =
+                        (part.Position - root.Position).Magnitude
+
+                    if distance < nearestDistance then
+                        nearest = model
+                        nearestZone = zone
+                        nearestId = id
+                        nearestDistance = distance
+                    end
+                end
+            end
+
+            if nearest then
+                return nearestZone, {
+                    [nearestId] = true,
+                }, nil, nil, nearest
+            end
+
+            return nil
+        end
+
         local function BuildPlan(level)
+            if pumpkinEnabled then
+                local zone, ids, reason, gateId, eventTarget =
+                    BuildPumpkinPlan(level)
+
+                if zone then
+                    return zone, ids, reason, gateId, eventTarget
+                end
+
+                if not farmRequested then
+                    return nil, nil,
+                        "Waiting for an accessible Pumpkin Spider"
+                end
+            end
+
             if mode == "Select Monster" then
                 if not selectedId then
                     return nil, nil, "Select a monster"
@@ -1758,6 +1876,11 @@ do
         end)
 
         local function Step()
+            if chestTripActive then
+                SetStatus("Opening chest: farming paused")
+                return
+            end
+
             if sellTripActive then
                 FinishFarmTravel(false)
                 StopFarmHover()
@@ -1819,7 +1942,8 @@ do
                 return
             end
 
-            local zone, ids, reason, bossGateId = BuildPlan(level)
+            local zone, ids, reason, bossGateId, eventTarget =
+                BuildPlan(level)
 
             if not zone then
                 FinishFarmTravel(true)
@@ -1839,8 +1963,13 @@ do
                 local id = model:GetAttribute("MonsterId")
                 if not ids[id] then return nil end
 
+                if eventTarget and model ~= eventTarget then
+                    return nil
+                end
+
                 -- แผนบอสอนุญาตเฉพาะ MonsterId ที่ BuildPlan เลือก
                 if mode == "Farm Level" and not bossGateId
+                    and not eventTarget
                     and not IsRegular(id, model) then
                     return nil
                 end
@@ -1848,7 +1977,7 @@ do
                 return GetMonsterPart(model)
             end
 
-            if bossGateId or isCasting then
+            if bossGateId or eventTarget or isCasting then
                 -- หยุดลากมอน เพื่อโฟกัสบอสปลดด่าน
                 if pullSession then
                     ResetPull(true)
@@ -2160,7 +2289,14 @@ do
             Default = false,
             Callback = function(value)
                 if not alive then return end
-                if value then Start() else Stop() end
+
+                farmRequested = value == true
+
+                if farmRequested or pumpkinEnabled then
+                    Start()
+                else
+                    Stop()
+                end
             end,
         })
 
@@ -2186,7 +2322,7 @@ do
                 if not alive or not wanted
                     or potionTripActive or farmPullActive
                     or dropTripActive or sellTripActive
-                    or farmTravelActive then
+                    or farmTravelActive or chestTripActive then
                     return
                 end
 
@@ -2639,6 +2775,11 @@ do
                 end
 
                 local function PreparePotionTrip(character, humanoid, root)
+                    if chestTripActive then
+                        BuyStatus("Waiting for chest collection")
+                        return false
+                    end
+
                     if farmTravelActive then
                         BuyStatus("Waiting for farm zone travel")
                         return false
@@ -3316,6 +3457,7 @@ do
                     local function CheckDrops()
                         if potionTripActive or sellTripActive
                             or farmPullActive or farmTravelActive
+                            or chestTripActive
                             or (Options.ZeroXFly
                                 and Options.ZeroXFly.Value) then
                             FinishDropTrip(true)
@@ -4109,7 +4251,8 @@ do
                     end
 
                     if blocked or potionTripActive
-                        or dropTripActive or farmTravelActive then
+                        or dropTripActive or farmTravelActive
+                        or chestTripActive then
                         return
                     end
                     if os.clock() - lastAttempt < interval then return end
@@ -4382,6 +4525,551 @@ do
                     junkEnabled = false
                     bulkEnabled = false
                     StopSellWorker()
+                end)
+            end
+        end
+
+        do
+            local chestSection = Tabs.Event:AddSection({
+                Title = "World Chests",
+                Icon = "gift",
+            })
+
+            local chestInputStatus = chestSection:AddLabel({
+                Title = "Interaction",
+                Value = "รอเปิดใช้งาน",
+            })
+
+
+
+            local halloweenSection = Tabs.Event:AddSection({
+                Title = "Halloween",
+                Icon = "gift",
+            })
+
+
+            halloweenSection:AddToggle("ZeroXAutoBossHalloween", {
+                Title = "Auto Boss Halloween",
+                Description = "ตีบอส Pumpkin Spider ออโต้",
+                Default = false,
+
+                Callback = function(value)
+                    if not alive then return end
+
+                    pumpkinEnabled = value == true
+
+                    FinishFarmTravel(true)
+                    ResetPull(true)
+                    ClearTarget()
+
+                    if pumpkinEnabled or farmRequested then
+                        Start()
+                    else
+                        Stop()
+                    end
+                end,
+            })
+
+            local inputAvailable, virtualInput = pcall(function()
+                return game:GetService("VirtualInputManager")
+            end)
+
+            if not inputAvailable then
+                chestInputStatus:SetValue("ไม่สามารถเข้าถึงระบบจำลองปุ่ม")
+            end
+
+            if inputAvailable and virtualInput then
+                local chestEnabled = false
+                local chestWorker
+                local chestTrip
+                local chests = {}
+                local retryAt = setmetatable({}, { __mode = "k" })
+                local lastSend = -math.huge
+
+                local promptService =
+                    game:GetService("ProximityPromptService")
+                local inputService =
+                    game:GetService("UserInputService")
+
+                local shownPrompts = setmetatable(
+                    {}, { __mode = "k" }
+                )
+
+                local keyDown = false
+                local releaseTask
+
+                Connect(promptService.PromptShown, function(prompt)
+                    shownPrompts[prompt] = true
+                end)
+
+                Connect(promptService.PromptHidden, function(prompt)
+                    shownPrompts[prompt] = nil
+                end)
+
+                local function ReleaseChestKey()
+                    if releaseTask then
+                        task.cancel(releaseTask)
+                        releaseTask = nil
+                    end
+
+                    if not keyDown then return end
+
+                    local ok, err = pcall(function()
+                        virtualInput:SendKeyEvent(
+                            false, Enum.KeyCode.E, false, game
+                        )
+                    end)
+
+                    if ok then
+                        keyDown = false
+                    else
+                        chestInputStatus:SetValue(
+                            "ปล่อย E ไม่สำเร็จ: " .. tostring(err)
+                        )
+                    end
+                end
+
+                local function ChestPromptVisible(prompt, part)
+                    if shownPrompts[prompt] then return true end
+
+                    -- รองรับ Prompt ที่แสดงอยู่ก่อนเริ่มติดตาม Event
+                    local playerGui =
+                        LocalPlayer:FindFirstChildOfClass("PlayerGui")
+                    local gui = playerGui
+                        and playerGui:FindFirstChild("HuntBoxPrompt")
+
+                    return gui and gui:IsA("BillboardGui")
+                        and gui.Enabled and gui.Adornee == part
+                end
+
+                -- ค่านโยบายของสคริปต์
+                local SEARCH_RADIUS = 1000
+                local RESULT_TIMEOUT = 2
+                local RETRY_DELAY = 10
+
+                local function Finite(value)
+                    return type(value) == "number"
+                        and value == value
+                        and math.abs(value) < math.huge
+                end
+
+                local function ChestPart(box)
+                    if not box:IsDescendantOf(workspace)
+                        or not CollectionService:HasTag(box, "LootBox") then
+                        return nil
+                    end
+
+                    local part
+
+                    if box:IsA("BasePart") then
+                        part = box
+                    elseif box:IsA("Model") then
+                        part = box.PrimaryPart
+                            or box:FindFirstChildWhichIsA("BasePart")
+                    end
+
+                    if not part or not part:IsA("BasePart")
+                        or not part:IsDescendantOf(workspace) then
+                        return nil
+                    end
+
+                    local owner = box:GetAttribute("OwnerUserId")
+                    local freeAt = box:GetAttribute("FreeAt") or 0
+
+                    if not Finite(freeAt) then return nil end
+
+                    if owner ~= 0 and owner ~= LocalPlayer.UserId
+                        and freeAt > workspace:GetServerTimeNow() then
+                        return nil
+                    end
+
+                    return part
+                end
+
+                local function AddChest(box)
+                    if box:IsA("BasePart") or box:IsA("Model") then
+                        chests[box] = true
+                    end
+                end
+
+                Connect(
+                    CollectionService:GetInstanceAddedSignal("LootBox"),
+                    AddChest
+                )
+
+                Connect(
+                    CollectionService:GetInstanceRemovedSignal("LootBox"),
+                    function(box)
+                        chests[box] = nil
+                    end
+                )
+
+                for _, box in ipairs(
+                    CollectionService:GetTagged("LootBox")
+                ) do
+                    AddChest(box)
+                end
+
+                local function FinishChestTrip(returnToOrigin)
+                    ReleaseChestKey()
+
+                    local old = chestTrip
+                    chestTrip = nil
+
+                    if not old then
+                        chestTripActive = false
+                        return
+                    end
+
+                    StopFarmHover()
+
+                    local humanoid = old.Character
+                        :FindFirstChildOfClass("Humanoid")
+
+                    local valid = LocalPlayer.Character == old.Character
+                        and humanoid and humanoid.Health > 0
+                        and old.Root.Parent
+                        and not old.Root.Anchored
+
+                    if returnToOrigin and valid then
+                        humanoid:Move(Vector3.zero, false)
+                        old.Root.CFrame = old.Origin
+                        old.Root.AssemblyLinearVelocity = Vector3.zero
+                        old.Root.AssemblyAngularVelocity = Vector3.zero
+                    end
+
+                    chestTripActive = false
+
+                    if returnToOrigin and valid and alive
+                        and old.AutoWasOn
+                        and not potionTripActive
+                        and not sellTripActive
+                        and not dropTripActive
+                        and not farmTravelActive then
+
+                        local menu =
+                            LocalPlayer:FindFirstChild("LumiMenuToggle")
+
+                        if menu and menu:IsA("BindableEvent")
+                            and LocalPlayer:GetAttribute("AutoOn") ~= true then
+                            menu:Fire("autoToggle")
+                        end
+                    end
+                end
+
+                local function CheckChests()
+                    if potionTripActive or sellTripActive
+                        or dropTripActive or farmTravelActive
+                        or (Options.ZeroXFly
+                            and Options.ZeroXFly.Value) then
+                        FinishChestTrip(true)
+                        return
+                    end
+
+                    local character = LocalPlayer.Character
+                    local humanoid = character
+                        and character:FindFirstChildOfClass("Humanoid")
+                    local root = humanoid and humanoid.RootPart
+
+                    if not humanoid or humanoid.Health <= 0
+                        or not root or not root:IsA("BasePart")
+                        or not root.Parent then
+                        FinishChestTrip(false)
+                        return
+                    end
+
+                    if chestTrip and (
+                        chestTrip.Character ~= character
+                        or chestTrip.Root ~= root
+                    ) then
+                        FinishChestTrip(false)
+                        return
+                    end
+
+                    if root.Anchored then
+                        FinishChestTrip(true)
+                        return
+                    end
+
+                    local used = LocalPlayer:GetAttribute("BagSlotsUsed")
+                    local maximum = LocalPlayer:GetAttribute("BagSlotsMax")
+
+                    if not Finite(used) or not Finite(maximum)
+                        or maximum <= 0 or used >= maximum then
+                        FinishChestTrip(true)
+                        return
+                    end
+
+                    local now = os.clock()
+
+                    if chestTrip then
+                        local trip = chestTrip
+                        local part = ChestPart(trip.Box)
+
+                        if not part then
+                            -- กล่องหายไม่ยืนยันว่าเราเป็นคนได้รับรางวัล
+                            FinishChestTrip(true)
+                            return
+                        end
+
+                        if now - trip.StartedAt >= 6
+                            or (trip.SentAt
+                                and now - trip.SentAt >= RESULT_TIMEOUT) then
+                            retryAt[trip.Box] = now + RETRY_DELAY
+                            FinishChestTrip(true)
+                            return
+                        end
+
+                        if LocalPlayer:GetAttribute("AutoOn") == true then
+                            return
+                        end
+
+                        if now < skillCastUntil then
+                            chestInputStatus:SetValue(
+                                "พบกล่องแล้ว รอร่ายจบก่อนเดินทาง"
+                            )
+                            return
+                        end
+
+                        local destination = part.Position
+                            + Vector3.new(0, 2, 0)
+                        local facing = CFrame.new(destination)
+                            * root.CFrame.Rotation
+
+                        humanoid:Move(Vector3.zero, false)
+
+                        if not trip.Moved then
+                            root.CFrame = facing
+                            root.AssemblyLinearVelocity = Vector3.zero
+                            root.AssemblyAngularVelocity = Vector3.zero
+
+                            HoldFarmPosition(
+                                humanoid, root, destination, facing
+                            )
+
+                            trip.Moved = true
+                            return
+                        end
+
+                        HoldFarmPosition(
+                            humanoid, root, destination, facing
+                        )
+
+                        if not trip.SentAt and now - lastSend >= 0.5 then
+                            local prompt = part:FindFirstChild("OpenPrompt")
+
+                            if not prompt
+                                or not prompt:IsA("ProximityPrompt") then
+                                chestInputStatus:SetValue(
+                                    "รอ OpenPrompt ของกล่องโหลด"
+                                )
+                                return
+                            end
+
+                            if not promptService.Enabled
+                                or not prompt.Enabled
+                                or prompt.KeyboardKeyCode
+                                    ~= Enum.KeyCode.E
+                                or prompt.HoldDuration ~= 0 then
+                                chestInputStatus:SetValue(
+                                    "Prompt ยังไม่พร้อม หรือไม่ใช่ E แบบแตะ"
+                                )
+                                return
+                            end
+
+                            if inputService:GetFocusedTextBox() then
+                                chestInputStatus:SetValue(
+                                    "รอออกจากช่องพิมพ์ข้อความ"
+                                )
+                                return
+                            end
+
+                            if (root.Position - part.Position).Magnitude
+                                > prompt.MaxActivationDistance then
+                                chestInputStatus:SetValue(
+                                    "อยู่นอกระยะ OpenPrompt"
+                                )
+                                return
+                            end
+
+                            if not ChestPromptVisible(prompt, part) then
+                                chestInputStatus:SetValue(
+                                    "รอป้าย E ของกล่องเป้าหมาย"
+                                )
+                                return
+                            end
+
+                            -- E เป็นปุ่มรวม ตรวจ Prompt อื่นที่อาจแย่งปุ่ม
+                            for other in pairs(shownPrompts) do
+                                if other ~= prompt
+                                    and other.Parent
+                                    and other.Enabled
+                                    and other.KeyboardKeyCode
+                                        == Enum.KeyCode.E then
+                                    chestInputStatus:SetValue(
+                                        "มี Prompt E อื่นใกล้เคียง"
+                                    )
+                                    return
+                                end
+                            end
+
+                            if keyDown then
+                                ReleaseChestKey()
+                                return
+                            end
+
+                            keyDown = true
+
+                            local ok, err = pcall(function()
+                                virtualInput:SendKeyEvent(
+                                    true, Enum.KeyCode.E, false, game
+                                )
+                            end)
+
+                            if not ok then
+                                ReleaseChestKey()
+                                chestEnabled = false
+                                FinishChestTrip(true)
+                                chestInputStatus:SetValue(
+                                    "กด E ไม่สำเร็จ: " .. tostring(err)
+                                )
+                                return
+                            end
+
+                            -- ระยะกดของสคริปต์ สำหรับ Prompt แบบ Instant Tap
+                            releaseTask = task.delay(0.05, function()
+                                releaseTask = nil
+                                ReleaseChestKey()
+                            end)
+
+                            lastSend = now
+                            trip.SentAt = now
+
+                            chestInputStatus:SetValue(
+                                "ส่งปุ่ม E แล้ว รอตรวจผลจากกล่อง"
+                            )
+                        end
+                        return
+                    end
+
+                    if now - lastSend < 0.5 then return end
+
+                    local nearest
+                    local distanceLimit = SEARCH_RADIUS
+
+                    for box in pairs(chests) do
+                        if now < (retryAt[box] or 0) then continue end
+
+                        local part = ChestPart(box)
+                        if part then
+                            local distance =
+                                (part.Position - root.Position).Magnitude
+
+                            if distance < distanceLimit then
+                                nearest = box
+                                distanceLimit = distance
+                            end
+                        end
+                    end
+
+                    if not nearest then
+                        chestInputStatus:SetValue(
+                            "ไม่พบกล่องที่มีสิทธิ์เปิดในระยะ "
+                                .. tostring(SEARCH_RADIUS)
+                        )
+                        return
+                    end
+
+                    local nativeRunning =
+                        LocalPlayer:GetAttribute("AutoOn") == true
+
+                    -- Pull อาจพัก Native Auto ไว้อยู่แล้ว
+                    local autoOn = nativeRunning
+                        or (
+                            pullSession ~= nil
+                            and pullSession.AutoWasOn == true
+                        )
+                    local menu =
+                        LocalPlayer:FindFirstChild("LumiMenuToggle")
+
+                    if autoOn and not (
+                        menu and menu:IsA("BindableEvent")
+                    ) then
+                        return
+                    end
+
+                    chestTrip = {
+                        Box = nearest,
+                        Character = character,
+                        Root = root,
+                        Origin = root.CFrame,
+                        AutoWasOn = autoOn,
+                        -- ไม่นับช่วงร่ายที่เหลือเป็นเวลารอเปิดกล่อง
+                        StartedAt = math.max(now, skillCastUntil),
+                    }
+
+                    chestTripActive = true
+                    ResetPull(false)
+                    ClearTarget()
+
+                    if nativeRunning then
+                        menu:Fire("autoToggle")
+                    end
+
+                    chestInputStatus:SetValue(
+                        "พบกล่องแล้ว พักฟาร์มเพื่อไปเปิด"
+                    )
+                end
+
+                local function StopChestWorker()
+                    chestEnabled = false
+
+                    if chestWorker then
+                        task.cancel(chestWorker)
+                        chestWorker = nil
+                    end
+
+                    FinishChestTrip(true)
+                end
+
+                Connect(LocalPlayer.CharacterRemoving, function()
+                    FinishChestTrip(false)
+                end)
+
+                chestSection:AddToggle("ZeroXAutoOpenChest", {
+                    Title = "Auto Open Chest",
+                    Description = "วาปเปิดกล่อง LootBox ออโต้ แล้วกลับจุดเดิม",
+                    Default = false,
+
+                    Callback = function(value)
+                        StopChestWorker()
+                        if not alive or value ~= true then return end
+
+                        chestEnabled = true
+
+                        chestWorker = task.defer(function()
+                            local ok, err = xpcall(function()
+                                while alive and chestEnabled do
+                                    CheckChests()
+                                    task.wait(0.2)
+                                end
+                            end, debug.traceback)
+
+                            chestWorker = nil
+
+                            if not ok then
+                                chestEnabled = false
+                                FinishChestTrip(true)
+                                warn("[Zero X / Chest] "
+                                    .. tostring(err))
+                            end
+                        end)
+                    end,
+                })
+
+                MacUI:OnUnload(function()
+                    StopChestWorker()
+                    table.clear(chests)
                 end)
             end
         end
