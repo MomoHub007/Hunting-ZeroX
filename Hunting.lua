@@ -2055,6 +2055,147 @@ do
             return part
         end
 
+        -- ระยะเผื่อขอบที่สคริปต์กำหนดเอง
+        local FARM_EDGE_MARGIN = 15
+
+        local function SafeFarmDestination(
+            zoneId, monsterPosition, preferred, reach
+        )
+            local zonesFolder = workspace:FindFirstChild("Zones")
+            local zonePart = zonesFolder
+                and zonesFolder:FindFirstChild(zoneId)
+
+            local map = workspace:FindFirstChild("Map")
+            local chunks = map and map:FindFirstChild("BlockFields")
+            local chunk = chunks and chunks:FindFirstChild(zoneId)
+            local island = chunk and chunk:FindFirstChild("Island")
+
+            if not zonePart or not zonePart:IsA("BasePart")
+                or not island then
+                return nil
+            end
+
+            -- รวมเฉพาะพื้นจริง ไม่รวม Barriers / Decor / โซนข้างเคียง
+            local floors = {}
+
+            for _, name in ipairs({ "Base", "Dirt" }) do
+                local part = island:FindFirstChild(name)
+
+                if part and part:IsA("BasePart")
+                    and part.CanCollide then
+                    table.insert(floors, part)
+                end
+            end
+
+            if #floors == 0 then return nil end
+
+            local halfX = zonePart.Size.X / 2 - FARM_EDGE_MARGIN
+            local halfZ = zonePart.Size.Z / 2 - FARM_EDGE_MARGIN
+
+            if halfX <= 0 or halfZ <= 0 then return nil end
+
+            local params = RaycastParams.new()
+            params.FilterType = Enum.RaycastFilterType.Include
+            params.FilterDescendantsInstances = floors
+            params.RespectCanCollide = true
+
+            local function Inside(point)
+                local localPoint =
+                    zonePart.CFrame:PointToObjectSpace(point)
+
+                return math.abs(localPoint.X) <= halfX
+                    and math.abs(localPoint.Z) <= halfZ
+            end
+
+            local function HasFloor(point)
+                local hit = workspace:Raycast(
+                    point + Vector3.new(0, 10, 0),
+                    Vector3.new(0, -200, 0),
+                    params
+                )
+
+                return hit ~= nil
+                    and hit.Normal.Y > 0.9
+                    and hit.Position.Y < point.Y
+            end
+
+            local function InRange(point)
+                return (point - monsterPosition).Magnitude <= reach
+            end
+
+            -- จุดเดิมปลอดภัยแล้ว ใช้ต่อเพื่อไม่ให้สลับฝั่งไปมา
+            if Inside(preferred)
+                and InRange(preferred)
+                and HasFloor(preferred) then
+                return preferred
+            end
+
+            local function ClampInside(point)
+                local localPoint =
+                    zonePart.CFrame:PointToObjectSpace(point)
+
+                local worldPoint =
+                    zonePart.CFrame:PointToWorldSpace(Vector3.new(
+                        math.clamp(localPoint.X, -halfX, halfX),
+                        localPoint.Y,
+                        math.clamp(localPoint.Z, -halfZ, halfZ)
+                    ))
+
+                return Vector3.new(
+                    worldPoint.X, preferred.Y, worldPoint.Z
+                )
+            end
+
+            local insetPoint = ClampInside(preferred)
+            local candidates = {
+                insetPoint,
+                ClampInside(monsterPosition),
+            }
+
+            -- คงความสูงเดิมและคำนวณระยะราบจากระยะโจมตีจริง
+            local height = preferred.Y - monsterPosition.Y
+            local horizontal = math.sqrt(
+                math.max(0, reach * reach - height * height)
+            )
+
+            -- ค้นรอบมอนเฉพาะเมื่อจุดเดิมไม่ผ่าน
+            for ring = 1, 2 do
+                local distance = horizontal
+                    * (ring == 1 and 1 or 0.65)
+
+                for index = 0, 31 do
+                    local angle = index * math.pi * 2 / 32
+
+                    table.insert(candidates, Vector3.new(
+                        monsterPosition.X + math.cos(angle) * distance,
+                        preferred.Y,
+                        monsterPosition.Z + math.sin(angle) * distance
+                    ))
+                end
+            end
+
+            table.sort(candidates, function(a, b)
+                return (a - preferred).Magnitude
+                    < (b - preferred).Magnitude
+            end)
+
+            for _, point in ipairs(candidates) do
+                if Inside(point)
+                    and InRange(point)
+                    and HasFloor(point) then
+                    return point
+                end
+            end
+
+            -- มอนอยู่นอกระยะที่เข้าถึงได้:
+            -- รอด้านในที่มีพื้น ไม่ตามออกขอบ
+            if Inside(insetPoint) and HasFloor(insetPoint) then
+                return insetPoint
+            end
+
+            return nil
+        end
+
         local function StepPull(eligible, character, humanoid, root, zone)
             local now = os.clock()
 
@@ -2140,7 +2281,10 @@ do
                     Anchor = root.Position,
                     AnchorCFrame = root.CFrame,
                     Queue = queue,
-                    Tagged = {},
+                    -- จำมอนหลักรวมอยู่ในชุดที่ต้องจัดการ
+                    Tagged = {
+                        [mainTarget] = true,
+                    },
                     Index = 1,
                     Phase = "Pull",
                     StartedAt = now,
@@ -2185,16 +2329,71 @@ do
                 return true
             end
 
-            -- มอนหลักตาย/หาย/ไม่ตรงเงื่อนไขแล้ว จบรอบนี้
-            if not eligible(session.MainTarget) then
-                ResetPull(true)
-                ClearTarget()
-                return true
+            if session.Phase == "Fight" then
+                local remaining = 0
+                local fightTarget
+                local nearestDistance = math.huge
+
+                -- จัดการเฉพาะชุดเดิม ไม่ค้นหามอนชุดใหม่
+                for model in pairs(session.Tagged) do
+                    local hp = tonumber(model:GetAttribute("HP"))
+
+                    if hp and hp <= 0 then
+                        session.Tagged[model] = nil
+                    else
+                        remaining += 1
+
+                        local part = eligible(model)
+
+                        if part then
+                            -- ตีตัวเดิมต่อจนตาย ก่อนเปลี่ยนตัว
+                            if model == target then
+                                fightTarget = model
+                            elseif not fightTarget
+                                or fightTarget ~= target then
+                                local distance =
+                                    (part.Position - root.Position).Magnitude
+
+                                if distance < nearestDistance then
+                                    nearestDistance = distance
+                                    fightTarget = model
+                                end
+                            end
+                        end
+                    end
+                end
+
+                if remaining == 0 then
+                    ResetPull(true)
+                    ClearTarget()
+                    SetStatus("Pull: pack cleared; ready for next pull")
+                    return true
+                end
+
+                if not fightTarget then
+                    -- การหายจาก Client ไม่ยืนยันว่ามอนตาย
+                    -- จึงไม่เริ่มลากชุดใหม่จากเหตุนี้
+                    if target then
+                        ClearTarget()
+                    end
+
+                    HoldFarmPosition(
+                        humanoid, root, root.Position, root.CFrame
+                    )
+
+                    SetStatus(
+                        "Pull: waiting for remaining pack to load"
+                    )
+                    return true
+                end
+
+                return false, fightTarget
             end
 
-            if session.Phase == "Fight" then
-                -- ส่งมอนตัวเดิมกลับให้ระบบโจมตี/ลอยหลังเดิม
-                return false, session.MainTarget
+            -- มอนหลักตายระหว่างลาก ให้หยุดลากเพิ่ม
+            -- แล้วจัดการมอนที่สะกิดมาแล้วก่อน
+            if not eligible(session.MainTarget) then
+                session.Index = #session.Queue + 1
             end
 
             if LocalPlayer:GetAttribute("AutoOn") == true then
@@ -2224,8 +2423,17 @@ do
                         end
                     end
 
-                    SetStatus("Pull: returning to original monster")
-                    return false, session.MainTarget
+                    if session.HitConnection then
+                        session.HitConnection:Disconnect()
+                        session.HitConnection = nil
+                    end
+
+                    SetStatus(
+                        "Pull: finishing current pack before pulling again"
+                    )
+
+                    -- รอบหน้าจะเลือกจาก Tagged เท่านั้น
+                    return true
                 end
 
                 local part = IsPullable(model, eligible)
@@ -2249,6 +2457,14 @@ do
                     or now - session.TargetAt >= PULL_APPROACH_TIMEOUT
                     or (session.SentAt
                         and now - session.SentAt >= PULL_THREAT_TIMEOUT) then
+
+                    -- เก็บตัวที่เห็น HP ลด หรือยืนยันว่ากำลังตามเรา
+                    if part and (
+                        session.HitObserved
+                        or threat == LocalPlayer.UserId
+                    ) then
+                        session.Tagged[model] = true
+                    end
 
                     if session.HitConnection then
                         session.HitConnection:Disconnect()
@@ -2320,8 +2536,22 @@ do
                     + session.HoverDirection * horizontalDistance
                     + Vector3.new(0, height, 0)
 
+                destination = SafeFarmDestination(
+                    zone.Id, part.Position, destination, reach
+                )
+
+                if destination then
+                    local offset = destination - part.Position
+                    local flat = Vector3.new(offset.X, 0, offset.Z)
+
+                    if flat.Magnitude > 0.01 then
+                        session.HoverDirection = flat.Unit
+                    end
+                end
+
                 -- คงข้อจำกัดโซนและระยะลากเดิม
-                if not InsidePullZone(session.Zone, destination)
+                if not destination
+                    or not InsidePullZone(session.Zone, destination)
                     or (destination - session.Anchor).Magnitude
                         > PULL_RADIUS + 15 then
 
@@ -3579,12 +3809,19 @@ do
                 return GetMonsterPart(model)
             end
 
-            if bossGateId or eventTarget or isCasting then
+            if bossGateId or eventTarget then
                 -- หยุดลากมอน เพื่อโฟกัสบอสปลดด่าน
                 if pullSession then
                     ResetPull(true)
                     ClearTarget()
                 end
+            elseif isCasting
+                and not (
+                    pullSession
+                    and pullSession.Phase == "Fight"
+                ) then
+                -- ระหว่างร่ายหยุดลากชั่วคราว
+                -- ไม่ล้างชุดมอนที่กำลังจัดการ
             else
                 local pullHandled, groupTarget = StepPull(
                     Eligible,
@@ -3706,6 +3943,33 @@ do
             local destination = targetPart.Position
                 + behind * behindDistance
                 + Vector3.new(0, height, 0)
+
+            -- แก้ขอบเฉพาะฟาร์มทั่วไป
+            -- ห้องบอสยังใช้ระบบขอบและ Auto Dodge เดิม
+            if not bossGateId then
+                destination = SafeFarmDestination(
+                    zone.Id,
+                    targetPart.Position,
+                    destination,
+                    reach
+                )
+
+                if not destination then
+                    ClearTarget()
+                    SetStatus(
+                        "Farm: waiting for verified zone / floor"
+                    )
+                    return
+                end
+
+                -- จำฝั่งด้านในใหม่ ไม่ย้อนกลับไปฝั่งนอกขอบทุก Tick
+                local offset = destination - targetPart.Position
+                local flat = Vector3.new(offset.X, 0, offset.Z)
+
+                if flat.Magnitude > 0.01 then
+                    farmSideDirection = flat.Unit
+                end
+            end
 
             -- หันเฉพาะแนวราบ ป้องกันตัวละครเอียงตามมอน
             local facing = CFrame.lookAt(
