@@ -6894,6 +6894,8 @@ do
                 end
 
                 local sellTrip
+                local SELL_ARRIVAL_DELAY = 1.5
+                local SELL_MERCHANT_DISTANCE = 12
 
                 local function FinishSellTrip(returnToOrigin)
                     local old = sellTrip
@@ -6961,10 +6963,6 @@ do
                         return false
                     end
 
-                    -- ถ้าขายได้ตรงนี้อยู่แล้ว ไม่ต้องเดินทาง
-                    if not sellTrip and CanSellHere() then
-                        return true
-                    end
 
                     local map = workspace:FindFirstChild("Map")
                     local npcs = map and map:FindFirstChild("NPCs")
@@ -7022,8 +7020,15 @@ do
 
                     humanoid:Move(Vector3.zero, false)
 
-                    if not sellTrip.Moved then
-                        local pivot = merchant:GetPivot()
+                    local pivot = merchant:GetPivot()
+                    local distance =
+                        (root.Position - pivot.Position).Magnitude
+
+                    if not sellTrip.Moved
+                        or distance > SELL_MERCHANT_DISTANCE then
+                        -- หากถูกดึงออกจาก NPC ต้องเริ่มรอใหม่
+                        sellTrip.ArrivedAt = nil
+
                         local position =
                             (pivot * CFrame.new(0, 0, 4)).Position
 
@@ -7034,12 +7039,26 @@ do
                         root.AssemblyAngularVelocity = Vector3.zero
 
                         sellTrip.Moved = true
-                        SellStatus("Moved to Merchant; checking distance")
+                        SellStatus("Moved to Merchant; checking arrival")
                         return false
                     end
 
-                    return (root.Position
-                        - merchant:GetPivot().Position).Magnitude <= 20
+                    -- เริ่มนับหลังรอบถัดมายืนยันว่าอยู่ใกล้ NPC จริง
+                    local now = os.clock()
+                    sellTrip.ArrivedAt = sellTrip.ArrivedAt or now
+
+                    local remaining = SELL_ARRIVAL_DELAY
+                        - (now - sellTrip.ArrivedAt)
+
+                    if remaining > 0 then
+                        SellStatus(string.format(
+                            "At Merchant; selling in %.1fs",
+                            remaining
+                        ))
+                        return false
+                    end
+
+                    return true
                 end
 
                 Connect(LocalPlayer.CharacterRemoving, function()
