@@ -76,7 +76,10 @@ local Window = MacUI:CreateWindow({
 	Theme = "Dark", -- "Dark" | "Light" | "Midnight" | "Ocean" | "Rose"
 	Accent = "Blue", -- accent name, hex string or Color3
 	SidebarStyle = "Tile", -- "Tile" | "Tinted" | "Plain"
-	Profile = { Title = LocalPlayer.DisplayName, Subtitle = "@" .. LocalPlayer.Name }, -- or true
+	Profile = {
+		Title = "Zero X Script",
+		Subtitle = "Zero X Script",
+	},
 	MinimizeKey = Enum.KeyCode.RightControl,
 	Acrylic = false, -- frosted-glass sidebar (graphics quality 8+)
 	KeybindList = false, -- floating list of keybinds and shortcuts
@@ -92,6 +95,162 @@ local Window = MacUI:CreateWindow({
 	Undo = true, -- Ctrl + Z / Ctrl + Shift + Z for changes you make
 	PerformanceGuard = true, -- pause blur and animations if the game slows down
 })
+
+do
+    local CUSTOM_NAME = "Zero X Script"
+    local active = true
+
+    local watchedCharacter
+    local watchedLabel
+    local originalText
+    local textConnection
+    local treeConnections = {}
+    local refreshQueued = false
+
+    local function UnbindLabel()
+        if textConnection then
+            textConnection:Disconnect()
+            textConnection = nil
+        end
+
+        if watchedLabel and watchedLabel.Parent
+            and watchedLabel.Text == CUSTOM_NAME
+            and originalText ~= nil then
+            watchedLabel.Text = originalText
+        end
+
+        watchedLabel = nil
+        originalText = nil
+    end
+
+    local function ResolveLabel()
+        local character = watchedCharacter
+
+        if not character
+            or LocalPlayer.Character ~= character then
+            return nil
+        end
+
+        local head = character:FindFirstChild("Head")
+        if not head or not head:IsA("BasePart") then
+            return nil
+        end
+
+        local gui = head:FindFirstChild("LumiNameTag")
+        if not gui or not gui:IsA("BillboardGui") then
+            return nil
+        end
+
+        local nameTag = gui:FindFirstChild("NameTag")
+        if not nameTag or not nameTag:IsA("Frame") then
+            return nil
+        end
+
+        local plate = nameTag:FindFirstChild("Plate")
+        if not plate or not plate:IsA("Frame") then
+            return nil
+        end
+
+        local label = plate:FindFirstChild("Name")
+
+        if label and label:IsA("TextLabel") then
+            return label
+        end
+
+        return nil
+    end
+
+    local function Refresh()
+        if not active then return end
+
+        local label = ResolveLabel()
+        if label == watchedLabel then return end
+
+        UnbindLabel()
+        if not label then return end
+
+        watchedLabel = label
+        originalText = label.Text
+
+        textConnection =
+            label:GetPropertyChangedSignal("Text"):Connect(function()
+                if not active or watchedLabel ~= label then
+                    return
+                end
+
+                -- เกมอัปเดตชื่อใหม่เมื่อ Level / Job / Title เปลี่ยน
+                if label.Text ~= CUSTOM_NAME then
+                    originalText = label.Text
+                    label.Text = CUSTOM_NAME
+                end
+            end)
+
+        label.Text = CUSTOM_NAME
+    end
+
+    local function QueueRefresh()
+        if not active or refreshQueued then return end
+        refreshQueued = true
+
+        task.defer(function()
+            refreshQueued = false
+
+            if active then
+                Refresh()
+            end
+        end)
+    end
+
+    local function ClearCharacter()
+        for _, connection in ipairs(treeConnections) do
+            connection:Disconnect()
+        end
+
+        table.clear(treeConnections)
+        watchedCharacter = nil
+        UnbindLabel()
+    end
+
+    local function BindCharacter(character)
+        ClearCharacter()
+        if not active then return end
+
+        watchedCharacter = character
+
+        -- ตรวจเส้นทางสั้น ๆ เมื่อมีการสร้าง/ลบป้าย
+        -- ไม่สแกน GetDescendants และไม่ใช้ Loop
+        table.insert(treeConnections,
+            character.DescendantAdded:Connect(QueueRefresh)
+        )
+
+        table.insert(treeConnections,
+            character.DescendantRemoving:Connect(QueueRefresh)
+        )
+
+        Refresh()
+    end
+
+    local addedConnection =
+        LocalPlayer.CharacterAdded:Connect(BindCharacter)
+
+    local removingConnection =
+        LocalPlayer.CharacterRemoving:Connect(function(character)
+            if watchedCharacter == character then
+                ClearCharacter()
+            end
+        end)
+
+    if LocalPlayer.Character then
+        BindCharacter(LocalPlayer.Character)
+    end
+
+    MacUI:OnUnload(function()
+        active = false
+        addedConnection:Disconnect()
+        removingConnection:Disconnect()
+        ClearCharacter()
+    end)
+end
 
 --------------------------------------------------------------------------------
 -- ANTI AFK: เปิดอัตโนมัติระหว่างใช้งานสคริปต์
@@ -510,10 +669,12 @@ local Tabs = {
     Event = Window:AddTab({
         Title = "Event",
         Icon = "gift",
+        Section = "Event",
     }),
     Party = Window:AddTab({
         Title = "Party",
         Icon = "users",
+        Section = "Party",
     }),
     Player = Window:AddTab({
         Title = "Player",
@@ -1422,6 +1583,8 @@ do
         local REPOSITION_DISTANCE = 0.75
         local WAIT_HEIGHT = 4
         local FARM_HOVER_HEIGHT = 30
+        local farmMovement = "Teleport"
+        local farmWalkActive = false
 
         local FarmTab = Tabs.AutoFarm
         local ShopTab = Tabs.Shop
@@ -1590,7 +1753,183 @@ do
             end
         end
 
+        local walkInfo = {
+            SetValue = function() end,
+        }
+
+        local nativeWalkOwned = false
+        local lastNativeWalkRequest = -math.huge
+
+        local walkUnlockModule = shared:FindFirstChild("UnlockData")
+        local walkUnlockData
+
+        if walkUnlockModule
+            and walkUnlockModule:IsA("ModuleScript") then
+            walkUnlockData = LoadModule(walkUnlockModule)
+        end
+
+        -- เก็บชื่อไว้รองรับคำสั่ง cleanup เดิม
+        -- ไม่มี Pathfinding หรือ RenderStep เดินแล้ว
+        local function StopFarmWalk()
+            farmWalkActive = false
+        end
+
+        local function ReleaseNativeWalk()
+            if not nativeWalkOwned then return end
+            nativeWalkOwned = false
+
+            -- Auto Use Skill ยังต้องใช้ Native Auto
+            local skillOption = Options.ZeroXAutoUseSkill
+            if skillOption and skillOption.Value == true then
+                return
+            end
+
+            local menu = LocalPlayer:FindFirstChild("LumiMenuToggle")
+
+            if menu and menu:IsA("BindableEvent")
+                and LocalPlayer:GetAttribute("AutoOn") == true then
+                menu:Fire("autoToggle")
+            end
+        end
+
+        local lastRoamRequest = -math.huge
+
+        local function EnsureNativeRoam()
+            if not alive or not enabled
+                or farmMovement ~= "Walk" then
+                return false
+            end
+
+            -- อ่านค่าล่าสุดเสมอ เพราะ SetBotSettings แทนที่ทั้งชุด
+            local raw = LocalPlayer:GetAttribute("BotJson")
+            if type(raw) ~= "string" or raw == "" then
+                walkInfo:SetValue("Waiting for BotJson")
+                return false
+            end
+
+            local ok, settings = pcall(function()
+                return HttpService:JSONDecode(raw)
+            end)
+
+            if not ok or type(settings) ~= "table"
+                or type(settings.FixedArea) ~= "boolean" then
+                -- ห้ามส่งค่าเริ่มต้นทับการตั้งค่าเดิมเมื่ออ่านข้อมูลไม่ได้
+                walkInfo:SetValue("Waiting for valid BotJson")
+                return false
+            end
+
+            -- ยืนยันจากสถานะที่เกมส่งกลับแล้วเท่านั้น
+            if settings.FixedArea == false then
+                return true
+            end
+
+            local setBotSettings =
+                remotes:FindFirstChild("SetBotSettings")
+
+            if not setBotSettings
+                or not setBotSettings:IsA("RemoteEvent") then
+                walkInfo:SetValue("SetBotSettings unavailable")
+                return false
+            end
+
+            local now = os.clock()
+            if now - lastRoamRequest >= 1 then
+                lastRoamRequest = now
+
+                -- เปลี่ยนเฉพาะ FixedArea ส่งฟิลด์อื่นกลับครบ
+                settings.FixedArea = false
+                setBotSettings:FireServer(settings)
+            end
+
+            walkInfo:SetValue("Waiting for Roam and fight")
+            return false
+        end
+
+        Connect(
+            LocalPlayer:GetAttributeChangedSignal("BotJson"),
+            function()
+                -- หากปรับเป็น Hold position ให้ตรวจและเปลี่ยนกลับ
+                task.defer(EnsureNativeRoam)
+            end
+        )
+
+        local function StepNativeFarmWalk(zone, model, tracker, root)
+            StopFarmWalk()
+            StopFarmHover()
+
+            -- ล้างเฉพาะตัวล็อกของสคริปต์ที่ตกค้าง
+            for _, spec in ipairs({
+                { "ZeroXFarmHoverPosition", "AlignPosition" },
+                { "ZeroXFarmHoverOrientation", "AlignOrientation" },
+                { "ZeroXFarmHoverAttachment", "Attachment" },
+            }) do
+                local object = root:FindFirstChild(spec[1])
+
+                if object and object:IsA(spec[2]) then
+                    object:Destroy()
+                end
+            end
+
+            if not EnsureNativeRoam() then
+                return
+            end
+
+            if LocalPlayer:GetAttribute("AutoOn") ~= true then
+                if not walkUnlockData
+                    or type(walkUnlockData.HasLevel) ~= "function" then
+                    walkInfo:SetValue("Waiting for native unlock data")
+                    return
+                end
+
+                if not walkUnlockData.HasLevel(
+                    LocalPlayer:GetAttribute("UnlockLevel"),
+                    "bot"
+                ) then
+                    walkInfo:SetValue("Native Auto is not unlocked")
+                    return
+                end
+
+                local menu =
+                    LocalPlayer:FindFirstChild("LumiMenuToggle")
+
+                if not menu or not menu:IsA("BindableEvent") then
+                    walkInfo:SetValue("Native Auto control unavailable")
+                    return
+                end
+
+                if os.clock() - lastNativeWalkRequest >= 1 then
+                    lastNativeWalkRequest = os.clock()
+                    nativeWalkOwned = true
+                    menu:Fire("autoToggle")
+                end
+
+                walkInfo:SetValue("Waiting for native Auto")
+                return
+            end
+
+            walkInfo:SetValue("Native Auto")
+            SetStatus(
+                "Native Walk: " .. zone.Id .. " | "
+                    .. (model and model.Name or "Waiting for native target")
+            )
+        end
+
+        MacUI:OnUnload(ReleaseNativeWalk)
+
         local function HoldFarmPosition(humanoid, root, position, facing)
+            -- Walk ปกติห้ามสร้างตัวล็อกตำแหน่ง
+            -- ทริปซื้อขาย/เก็บของ และ Auto Dodge ยังใช้ระบบเดิม
+            if farmMovement == "Walk"
+                and not potionTripActive
+                and not sellTripActive
+                and not dropTripActive
+                and not chestTripActive
+                and not bossDodgeActive then
+
+                StopFarmHover()
+                return
+            end
+
             if farmHover and (
                 farmHover.Root ~= root
                 or farmHover.Humanoid ~= humanoid
@@ -1651,6 +1990,8 @@ do
         end
 
         local function ClearTarget()
+            StopFarmWalk()
+
             if ResetBossDodge then
                 ResetBossDodge(true)
             end
@@ -3022,6 +3363,8 @@ do
         local TRAVEL_MAX_ATTEMPTS = 3
 
         local function FinishFarmTravel(restoreAuto)
+            StopFarmWalk()
+
             local old = farmTravel
             farmTravel = nil
             farmTravelActive = false
@@ -3436,15 +3779,31 @@ do
             end
 
             if zone.Kind == "cone" then
+                local direction = zone.Dir
+                local halfAngle = zone.Half
+
+                if typeof(direction) ~= "Vector3" then
+                    direction = zone.Facing
+                end
+
+                if not NumberOK(halfAngle)
+                    and NumberOK(zone.Angle) then
+                    halfAngle = math.rad(zone.Angle / 2)
+                end
+
                 if typeof(zone.Center) ~= "Vector3"
-                    or typeof(zone.Dir) ~= "Vector3"
+                    or typeof(direction) ~= "Vector3"
                     or not NumberOK(zone.Radius)
-                    or not NumberOK(zone.Half) then
+                    or zone.Radius <= 0
+                    or not NumberOK(halfAngle)
+                    or halfAngle <= 0
+                    or halfAngle > math.pi then
                     return nil
                 end
 
                 local offset = Flat(position - zone.Center)
-                local direction = Flat(zone.Dir)
+                direction = Flat(direction)
+
                 local distance = offset.Magnitude
 
                 if direction.Magnitude <= 0.001 then return nil end
@@ -3459,7 +3818,7 @@ do
                     direction.Unit:Dot(offset.Unit), -1, 1
                 ))
 
-                return angle <= zone.Half + extra
+                return angle <= halfAngle + extra
             end
 
             -- รองรับพื้นที่สี่เหลี่ยมตามข้อมูลที่ Native ใช้วาดจริง
@@ -3537,6 +3896,85 @@ do
             return true
         end
 
+        local function IsDodgeMonster(model)
+            if not model or not GetMonsterPart(model) then
+                return false
+            end
+
+            local id = model:GetAttribute("MonsterId")
+            local def = type(id) == "string" and monsterData[id]
+
+            return model:GetAttribute("IsBoss") == true
+                or model:GetAttribute("IsMiniBoss") == true
+                or model:GetAttribute("IsLeader") == true
+                or (
+                    type(def) == "table"
+                    and (
+                        def.Boss == true
+                        or def.MiniBoss == true
+                        or def.Leader == true
+                        or def.HalloweenPumpkin == true
+                    )
+                )
+        end
+
+        local function GetDodgeArea(areaId)
+            if type(areaId) ~= "string" then return nil end
+
+            local map = workspace:FindFirstChild("Map")
+            local chunks = map and map:FindFirstChild("BlockFields")
+            local chunk = chunks and chunks:FindFirstChild(areaId)
+            local island = chunk and chunk:FindFirstChild("Island")
+
+            if not island then return nil end
+
+            -- ห้องบอสใช้ขอบที่ตรวจยืนยันไว้เดิม
+            local roomBounds = dodgeRooms[areaId]
+
+            if roomBounds then
+                local floor = island:FindFirstChild(roomBounds.Floor)
+
+                if floor and floor:IsA("BasePart")
+                    and floor.CanCollide and floor.CanQuery then
+                    return floor, roomBounds, floor.CFrame
+                end
+
+                return nil
+            end
+
+            -- โซนปกติ: ใช้ Zone เป็นขอบ และ Base เป็นพื้นเท่านั้น
+            local zoneDef = zoneById[areaId]
+            if not zoneDef or zoneDef.Data.BossRoom == true then
+                return nil
+            end
+
+            local zonesFolder = workspace:FindFirstChild("Zones")
+            local zonePart = zonesFolder
+                and zonesFolder:FindFirstChild(areaId)
+            local floor = island:FindFirstChild("Base")
+
+            if not zonePart or not zonePart:IsA("BasePart")
+                or not floor or not floor:IsA("BasePart")
+                or not floor.CanCollide or not floor.CanQuery then
+                return nil
+            end
+
+            -- ระยะเผื่อขอบของสคริปต์ ไม่ใช่ขอบเซิร์ฟเวอร์
+            local edgeMargin = 15
+            local halfX = zonePart.Size.X / 2 - edgeMargin
+            local halfZ = zonePart.Size.Z / 2 - edgeMargin
+
+            if halfX <= DODGE_MARGIN
+                or halfZ <= DODGE_MARGIN then
+                return nil
+            end
+
+            return floor, {
+                HalfX = halfX,
+                HalfZ = halfZ,
+            }, zonePart.CFrame
+        end
+
         local bossFx = FindRequired(remotes, "BossFx", "RemoteEvent")
 
         if bossFx then
@@ -3545,15 +3983,13 @@ do
             )
                 if not alive or not enabled or not dodgeEnabled
                     or not target or not GetMonsterPart(target)
-                    or mode ~= "Farm Level"
                     or potionTripActive or sellTripActive
                     or dropTripActive or chestTripActive
                     or farmTravelActive then
                     return
                 end
 
-                local gate = ProgressionGate(target)
-                if not gate or not dodgeRooms[gate] then return end
+                if not IsDodgeMonster(target) then return end
 
                 local id = target:GetAttribute("MonsterId")
                 local def = monsterData[id]
@@ -3597,8 +4033,11 @@ do
                     for _, event in ipairs(dodgeEvents) do
                         if event.Key == key and not event.Hit then
                             event.Hit = true
-                            event.Expires = now
-                                + math.max(DODGE_SETTLE, duration)
+                            event.Expires = now + math.max(
+                                DODGE_SETTLE,
+                                duration,
+                                event.PoolDuration or 0
+                            )
                             break
                         end
                     end
@@ -3629,6 +4068,18 @@ do
                 if type(def) == "table" then
                     skill = FindMove(def.Skills)
                         or FindMove(def.LeaderMoves)
+
+                    if not skill
+                        and def.HalloweenPumpkin == true
+                        and type(def.PumpkinFrom) == "string" then
+
+                        local base = monsterData[def.PumpkinFrom]
+
+                        if type(base) == "table" then
+                            skill = FindMove(base.Skills)
+                                or FindMove(base.LeaderMoves)
+                        end
+                    end
                 end
 
                 if not skill then
@@ -3639,11 +4090,16 @@ do
                     return
                 end
 
+                local poolDuration = 0
+
                 if skill.Pool then
-                    dodgeStatus:SetValue(
-                        "ยังไม่รองรับพื้นค้าง: " .. skillName
-                    )
-                    return
+                    if type(skill.Pool) ~= "table"
+                        or not NumberOK(skill.Pool.Duration)
+                        or skill.Pool.Duration < 0 then
+                        return
+                    end
+
+                    poolDuration = skill.Pool.Duration
                 end
 
                 if skill.Shape == "spin" then
@@ -3666,6 +4122,7 @@ do
                     Zones = snapshot,
                     Inner = skill.Shape == "donut" and skill.Inner or nil,
                     Expires = now + duration + DODGE_SETTLE,
+                    PoolDuration = poolDuration,
                 })
             end)
         end
@@ -3673,7 +4130,8 @@ do
         local function StepBossDodge(
             gate, model, character, humanoid, root
         )
-            if not dodgeEnabled or not gate or not dodgeRooms[gate] then
+            if not dodgeEnabled or not gate
+                or not IsDodgeMonster(model) then
                 if bossDodgeActive then ResetBossDodge(true) end
                 return false
             end
@@ -3706,6 +4164,7 @@ do
                 }
 
                 bossDodgeActive = true
+                StopFarmWalk()
                 StopFarmHover()
                 holding = false
                 setTarget:FireServer(nil, false)
@@ -3733,29 +4192,38 @@ do
                 end
             end
 
-            local map = workspace:FindFirstChild("Map")
-            local chunks = map and map:FindFirstChild("BlockFields")
-            local chunk = chunks and chunks:FindFirstChild(gate)
-            local island = chunk and chunk:FindFirstChild("Island")
-            local bounds = dodgeRooms[gate]
-            local floor = island and island:FindFirstChild(bounds.Floor)
+            local floor, bounds, boundaryFrame = GetDodgeArea(gate)
 
-            if not floor or not floor:IsA("BasePart") then
+            if not floor then
                 StopFarmHover()
-                dodgeStatus:SetValue("รอพื้นที่ห้องบอสโหลด")
+                dodgeStatus:SetValue("รอขอบโซนและพื้นจริงโหลด")
                 return true
             end
 
             local function InBounds(point)
-                local relative = floor.CFrame:PointToObjectSpace(point)
-                return math.abs(relative.X) <= bounds.HalfX - DODGE_MARGIN
-                    and math.abs(relative.Z)
-                        <= bounds.HalfZ - DODGE_MARGIN
+                local relative =
+                    boundaryFrame:PointToObjectSpace(point)
+
+                if math.abs(relative.X)
+                        > bounds.HalfX - DODGE_MARGIN
+                    or math.abs(relative.Z)
+                        > bounds.HalfZ - DODGE_MARGIN then
+                    return false
+                end
+
+                -- ต้องอยู่เหนือกรอบพื้นจริงด้วย
+                local floorPoint =
+                    floor.CFrame:PointToObjectSpace(point)
+
+                return math.abs(floorPoint.X)
+                        <= floor.Size.X / 2 - DODGE_MARGIN
+                    and math.abs(floorPoint.Z)
+                        <= floor.Size.Z / 2 - DODGE_MARGIN
             end
 
             local rayParams = RaycastParams.new()
             rayParams.FilterType = Enum.RaycastFilterType.Include
-            rayParams.FilterDescendantsInstances = { island }
+            rayParams.FilterDescendantsInstances = { floor }
             rayParams.RespectCanCollide = true
 
             local rejected = {
@@ -3858,7 +4326,6 @@ do
                                 for ring = 1, 3 do
                                     local radius =
                                         usableRadius * ring / 3
-
                                     for index = 0, 15 do
                                         local angle =
                                             index * math.pi * 2 / 16
@@ -3886,7 +4353,7 @@ do
                     for z = -bounds.HalfZ + 4,
                         bounds.HalfZ - 4, DODGE_GRID do
 
-                        local point = floor.CFrame:PointToWorldSpace(
+                        local point = boundaryFrame:PointToWorldSpace(
                             Vector3.new(x, 0, z)
                         )
 
@@ -3962,8 +4429,8 @@ do
 
         combatSection:AddToggle("ZeroXAutoDodgeBossSkill", {
             Title = "Auto Dodge Skill",
-            Description = "หลบสกิลบอสผ่านโซน Boss01–Boss04 "
-                .. "ตรวจพื้นที่โจมตีและวงเขียวจาก BossFx",
+            Description = "หลบสกิลบอสปลดด่าน บอสประจำโซน "
+                .. "Leader และ Pumpkin Spider ที่กำลังเป็นเป้าหมาย",
             Default = false,
 
             Callback = function(value)
@@ -4161,12 +4628,16 @@ do
 
                 humanoid:Move(Vector3.zero, false)
 
-                HoldFarmPosition(
-                    humanoid,
-                    root,
-                    root.Position,
-                    root.CFrame
-                )
+                if farmMovement == "Walk" then
+                    StopFarmHover()
+                else
+                    HoldFarmPosition(
+                        humanoid,
+                        root,
+                        root.Position,
+                        root.CFrame
+                    )
+                end
 
                 -- โซนที่เคยรอโหลดแล้ว ใช้เป็นทางผ่าน
                 if search.Visited[zone.Id] then
@@ -4278,7 +4749,7 @@ do
                 end
             end
 
-            if bossGateId or eventTarget or partyFarmEnabled then
+            if bossGateId or eventTarget or partyFarmEnabled or farmMovement == "Walk" then
                 -- หยุดลากมอน เพื่อโฟกัสบอสปลดด่าน
                 if pullSession then
                     ResetPull(true)
@@ -4308,26 +4779,55 @@ do
                 end
             end
 
-            local targetPart = target and Eligible(target)
+            local targetPart
 
-            if not targetPart then
-                ClearTarget()
-                local nearestDistance = math.huge
+            if farmMovement == "Walk" then
+                -- เกมเป็นผู้เลือกเป้าหมาย รวมถึงมอนที่เข้ามาคุกคาม
+                -- ไม่ ClearTarget หรือส่ง SetTarget สวนการเลือกของเกม
+                local nativeTarget = tracker.Value
+                local nativePart = nativeTarget
+                    and GetMonsterPart(nativeTarget)
 
-                for model in pairs(monsters) do
-                    local part = Eligible(model)
-                    if part then
-                        local distance = (part.Position - root.Position).Magnitude
-                        if distance < nearestDistance then
-                            nearestDistance = distance
-                            target = model
-                            targetPart = part
+                if target ~= nativeTarget and bossDodgeActive then
+                    ResetBossDodge(true)
+                end
+
+                target = nativePart and nativeTarget or nil
+                targetPart = nativePart
+
+                if not targetPart then
+                    StepNativeFarmWalk(
+                        zone, nil, tracker, root
+                    )
+                    return
+                end
+            else
+                targetPart = target and Eligible(target)
+
+                if not targetPart then
+                    ClearTarget()
+                    local nearestDistance = math.huge
+
+                    for model in pairs(monsters) do
+                        local part = Eligible(model)
+
+                        if part then
+                            local distance =
+                                (part.Position - root.Position).Magnitude
+
+                            if distance < nearestDistance then
+                                nearestDistance = distance
+                                target = model
+                                targetPart = part
+                            end
                         end
                     end
                 end
             end
 
             if not target or not targetPart then
+                StopFarmWalk()
+
                 local position = GetWaitPosition(zone)
 
                 if position then
@@ -4353,8 +4853,19 @@ do
             end
 
             if not bossHere and StepBossDodge(
-                bossGateId, target, character, humanoid, root
+                bossGateId or zone.Id,
+                target,
+                character,
+                humanoid,
+                root
             ) then
+                return
+            end
+
+            if farmMovement == "Walk" then
+                StepNativeFarmWalk(
+                    zone, target, tracker, root
+                )
                 return
             end
 
@@ -4523,6 +5034,7 @@ do
             end
 
             ClearTarget()
+            ReleaseNativeWalk()
             SetStatus("Stopped")
         end
 
@@ -4576,6 +5088,44 @@ do
                 if not alive then return end
                 mode = value
                 ClearTarget()
+            end,
+        })
+
+        section:AddDropdown("ZeroXFarmMovement", {
+            Title = "Movement Mode",
+            Description = "Teleport: วาปและลอยเข้าหามอน "
+                .. "Walk: ใช้ระบบเดินฟาร์ม "
+                .. "การเดินทางไปโซนเป้าหมายยังใช้วาป",
+            Values = { "Teleport", "Walk" },
+            Default = "Teleport",
+            Callback = function(value)
+                if not alive or (value ~= "Teleport" and value ~= "Walk") then
+                    return
+                end
+
+                ReleaseNativeWalk()
+                FinishFarmTravel(true)
+                ResetPull(true)
+                ClearTarget()
+                farmMovement = value
+            end,
+        })
+
+        section:AddSlider("ZeroXFarmHeight", {
+            Title = "Farm Height",
+            Description = "ความสูงเหนือมอนในโหมด Teleport "
+                .. "ความสูงไม่ใช้ในโหมด Walk",
+            Min = 0,
+            Max = 60,
+            Default = 30,
+            Increment = 1,
+            Callback = function(value)
+                if not alive or type(value) ~= "number"
+                    or value ~= value or value < 0 or value > 60 then
+                    return
+                end
+
+                FARM_HOVER_HEIGHT = value
             end,
         })
 
@@ -4713,7 +5263,7 @@ do
                     or potionTripActive or farmPullActive
                     or dropTripActive or sellTripActive
                     or farmTravelActive or chestTripActive
-                    or bossDodgeActive then
+                    or bossDodgeActive or farmWalkActive then
                     return
                 end
 
@@ -4957,7 +5507,7 @@ do
 
                 recoverySection:AddToggle("ZeroXAutoRespawn", {
                     Title = "Auto Respawn",
-                    Description = "เมื่อตาย เลือกเกิดในเมืองแบบฟรีตามเงื่อนไขของเกม",
+                    Description = "เมื่อตาย เลือกเกิดในเมืองแบบฟรี",
                     Default = false,
 
                     Callback = function(value)
@@ -8161,6 +8711,401 @@ do
             end)
         end
     end)
+end
+
+do
+    local function InitAutoQuest()
+        local RS = game:GetService("ReplicatedStorage")
+        local HttpService = game:GetService("HttpService")
+
+        local section = Tabs.AutoFarm:AddSection({
+            Title = "Auto Quest",
+            Icon = "scroll-text",
+        })
+
+        local status = section:AddLabel({
+            Title = "Quest Status",
+            Value = "ปิดใช้งาน",
+        })
+
+        local lastStatus
+        local function Report(message)
+            if message ~= lastStatus then
+                lastStatus = message
+                status:SetValue(message)
+            end
+        end
+
+        local shared = RS:WaitForChild("Shared", 5)
+        local remotes = RS:WaitForChild("Remotes", 5)
+        local module = shared and shared:WaitForChild("QuestData", 5)
+
+        if not module or not module:IsA("ModuleScript")
+            or not remotes then
+            Report("ไม่พบ QuestData / Remotes")
+            return
+        end
+
+        local ok, questData = pcall(require, module)
+
+        if not ok or type(questData) ~= "table"
+            or type(questData.Quests) ~= "table" then
+            Report("อ่าน QuestData.Quests ไม่ได้")
+            return
+        end
+
+        local alive = true
+        local enabled = false
+        local mode = "By Level"
+        local selectedId
+        local allowSwitch = false
+        local connections = {}
+
+        local catalog = {}
+        local choices = {}
+        local labelToId = {}
+        local activeQuests
+        local pending
+        local attempts = {}
+
+        -- ค่าของสคริปต์ ไม่ใช่ Cooldown ที่เซิร์ฟเวอร์กำหนด
+        local ACK_TIMEOUT = 5
+        local RETRY_DELAY = 15
+        local MAX_ATTEMPTS = 3
+
+        local function NumberOK(value)
+            return type(value) == "number"
+                and value == value
+                and math.abs(value) < math.huge
+        end
+
+        local entries = {}
+
+        for id, def in pairs(questData.Quests) do
+            if type(id) == "string"
+                and type(def) == "table"
+                and def.Repeat == true
+                and NumberOK(def.ReqLevel)
+                and def.ReqLevel >= 0 then
+
+                catalog[id] = def
+                table.insert(entries, {
+                    Id = id,
+                    Def = def,
+                })
+            end
+        end
+
+        table.sort(entries, function(a, b)
+            if a.Def.ReqLevel ~= b.Def.ReqLevel then
+                return a.Def.ReqLevel < b.Def.ReqLevel
+            end
+            return a.Id < b.Id
+        end)
+
+        for _, entry in ipairs(entries) do
+            local name = type(entry.Def.Name) == "string"
+                and entry.Def.Name or entry.Id
+
+            local label = string.format(
+                "Lv.%d | %s [%s]",
+                entry.Def.ReqLevel,
+                name,
+                entry.Id
+            )
+
+            labelToId[label] = entry.Id
+            table.insert(choices, label)
+        end
+
+        if #choices == 0 then
+            Report("ไม่พบเควสที่ Repeat == true")
+            return
+        end
+
+        local function ReadState()
+            activeQuests = nil
+
+            local raw = LocalPlayer:GetAttribute("QuestsJson")
+            if type(raw) ~= "string" or raw == "" then return end
+
+            local success, data = pcall(
+                HttpService.JSONDecode, HttpService, raw
+            )
+
+            if not success or type(data) ~= "table"
+                or type(data.Active) ~= "table" then
+                return
+            end
+
+            for id, progress in pairs(data.Active) do
+                if type(id) ~= "string"
+                    or not NumberOK(progress)
+                    or progress < 0 then
+                    return
+                end
+            end
+
+            activeQuests = data.Active
+        end
+
+        local function ResetAttempts()
+            -- ไม่ล้างคำขอที่ยังรอยืนยัน เพื่อไม่ส่งซ้อนทันที
+            table.clear(attempts)
+        end
+
+        local function Step()
+            if not alive or not enabled then return end
+
+            if not activeQuests then
+                Report("รอข้อมูล QuestsJson ที่ถูกต้อง")
+                return
+            end
+
+            local now = os.clock()
+
+            if pending then
+                if activeQuests[pending.Id] ~= nil then
+                    attempts[pending.Id] = nil
+                    pending = nil
+                elseif now - pending.SentAt < ACK_TIMEOUT then
+                    Report("รอยืนยันการรับ: " .. pending.Id)
+                    return
+                else
+                    local request = attempts[pending.Id]
+
+                    if request then
+                        request.NextAt = now + RETRY_DELAY
+                    end
+
+                    Report(
+                        "ยังไม่ยืนยันการรับ: " .. pending.Id
+                            .. " — ไม่ถือว่าเซิร์ฟเวอร์ปฏิเสธ"
+                    )
+
+                    pending = nil
+                    return
+                end
+            end
+
+            local level = LocalPlayer:GetAttribute("Level")
+            if not NumberOK(level) then
+                Report("รอข้อมูล Level")
+                return
+            end
+
+            local id
+
+            if mode == "Select Quest" then
+                id = selectedId
+
+                if not id or not catalog[id] then
+                    Report("เลือก Repeat Quest ก่อน")
+                    return
+                end
+            else
+                local bestLevel = -math.huge
+
+                for _, entry in ipairs(entries) do
+                    local required = entry.Def.ReqLevel
+
+                    if required <= level and required > bestLevel then
+                        bestLevel = required
+                        id = entry.Id
+                    end
+                end
+            end
+
+            local def = id and catalog[id]
+
+            if not def then
+                Report("ยังไม่มี Repeat Quest ที่รับได้ตามเลเวล")
+                return
+            end
+
+            if level < def.ReqLevel then
+                Report("ต้องการเลเวล " .. tostring(def.ReqLevel))
+                return
+            end
+
+            local progress = activeQuests[id]
+
+            if progress ~= nil then
+                attempts[id] = nil
+
+                if NumberOK(def.Count) and progress >= def.Count then
+                    Report(id .. " สำเร็จแล้ว — กดรับรางวัลในเกมเอง")
+                else
+                    Report(string.format(
+                        "%s | %s / %s",
+                        id,
+                        tostring(progress),
+                        tostring(def.Count or "?")
+                    ))
+                end
+
+                return
+            end
+
+            local otherRepeat
+
+            for activeId in pairs(activeQuests) do
+                local activeDef = questData.Quests[activeId]
+
+                if type(activeDef) == "table"
+                    and activeDef.Repeat == true then
+                    otherRepeat = activeId
+                    break
+                end
+            end
+
+            if otherRepeat and not allowSwitch then
+                Report(
+                    "มี Repeat อยู่แล้ว: " .. otherRepeat
+                        .. " — รอจบหรือเปิด Switch Active Repeat"
+                )
+                return
+            end
+
+            local request = attempts[id]
+
+            if request then
+                if request.Count >= MAX_ATTEMPTS then
+                    Report(
+                        "หยุดลองรับ " .. id
+                            .. " หลังไม่ยืนยัน 3 ครั้ง — ปิด/เปิด Auto Quest เพื่อลองใหม่"
+                    )
+                    return
+                end
+
+                if now < request.NextAt then
+                    Report("รอลองรับใหม่: " .. id)
+                    return
+                end
+            end
+
+            local remote = remotes:FindFirstChild("QuestAction")
+
+            if not remote or not remote:IsA("RemoteEvent") then
+                Report("ไม่พบ QuestAction ที่เป็น RemoteEvent")
+                return
+            end
+
+            request = request or {
+                Count = 0,
+                NextAt = 0,
+            }
+
+            request.Count += 1
+            request.NextAt = now + ACK_TIMEOUT + RETRY_DELAY
+            attempts[id] = request
+
+            pending = {
+                Id = id,
+                SentAt = now,
+            }
+
+            remote:FireServer("accept", id)
+            Report("ส่งคำขอรับ: " .. id .. " — รอ QuestsJson ยืนยัน")
+        end
+
+        section:AddDropdown("ZeroXQuestMode", {
+            Title = "Quest Mode",
+            Description = "By Level: เลือก Repeat ที่เลเวลรับได้สูงสุด "
+                .. "Select Quest: เลือกเควสเอง",
+            Values = { "By Level", "Select Quest" },
+            Default = "By Level",
+
+            Callback = function(value)
+                if not alive
+                    or (value ~= "By Level"
+                        and value ~= "Select Quest") then
+                    return
+                end
+
+                mode = value
+                ResetAttempts()
+            end,
+        })
+
+        section:AddDropdown("ZeroXRepeatQuest", {
+            Title = "Select Repeat Quest",
+            Description = "แสดงเฉพาะ Repeat ใช้เมื่อเลือก Select Quest",
+            Values = choices,
+            AllowNull = true,
+            Searchable = true,
+
+            Callback = function(value)
+                if not alive then return end
+                selectedId = labelToId[value]
+                ResetAttempts()
+            end,
+        })
+
+        section:AddToggle("ZeroXQuestSwitchRepeat", {
+            Title = "Switch Active Repeat",
+            Description = "อนุญาตรับ Repeat ใหม่แทนเควสเดิม",
+            Default = false,
+
+            Callback = function(value)
+                if not alive then return end
+                allowSwitch = value == true
+                ResetAttempts()
+            end,
+        })
+
+        section:AddToggle("ZeroXAutoQuest", {
+            Title = "Auto Quest",
+            Description = "ออโต้รับเฉพาะ Repeat เควสเท่านั้น",
+            Default = false,
+
+            Callback = function(value)
+                if not alive then return end
+
+                enabled = value == true
+                ResetAttempts()
+
+                if not enabled then
+                    Report("ปิดใช้งาน")
+                end
+            end,
+        })
+
+        table.insert(connections,
+            LocalPlayer:GetAttributeChangedSignal("QuestsJson"):Connect(
+                function()
+                    if alive then ReadState() end
+                end
+            )
+        )
+
+        ReadState()
+
+        local worker = task.spawn(function()
+            while alive do
+                task.wait(1)
+
+                if alive and enabled then
+                    Step()
+                end
+            end
+        end)
+
+        MacUI:OnUnload(function()
+            alive = false
+            enabled = false
+
+            task.cancel(worker)
+
+            for _, connection in ipairs(connections) do
+                connection:Disconnect()
+            end
+
+            table.clear(connections)
+        end)
+    end
+
+    InitAutoQuest()
 end
 
 -- Keep the original settings folders and custom theme loading.
