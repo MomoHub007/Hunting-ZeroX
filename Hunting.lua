@@ -671,6 +671,10 @@ local Tabs = {
         Icon = "gift",
         Section = "Event",
     }),
+    Reward = Window:AddTab({
+        Title = "Reward",
+        Icon = "gift",
+    }),
     Party = Window:AddTab({
         Title = "Party",
         Icon = "users",
@@ -8888,6 +8892,367 @@ do
     end
 
     InitAutoQuest()
+end
+
+do
+    local RS = game:GetService("ReplicatedStorage")
+    local HttpService = game:GetService("HttpService")
+
+    local alive = true
+    local rewardsEnabled = false
+    local bookEnabled = false
+    local nextScan = 0
+    local attempts = {}
+    local jsonCache = {}
+    local moduleCache = {}
+    local connections = {}
+
+    local rewardsSection = Tabs.Reward:AddSection({
+        Title = "Free Rewards",
+        Icon = "gift",
+    })
+
+    local rewardStatus = {
+        SetValue = function() end,
+    }
+
+    local bookSection = Tabs.Reward:AddSection({
+        Title = "Adventure Book",
+        Icon = "book-open",
+    })
+
+    local bookStatus = {
+        SetValue = function() end,
+    }
+
+    local function Finite(value)
+        return type(value) == "number"
+            and value == value
+            and math.abs(value) < math.huge
+    end
+
+    local function CharacterAlive()
+        local character = LocalPlayer.Character
+        local humanoid = character
+            and character:FindFirstChildOfClass("Humanoid")
+
+        return humanoid ~= nil and humanoid.Health > 0
+    end
+
+    local function FindRemote(name, className)
+        local remotes = RS:FindFirstChild("Remotes")
+        local object = remotes and remotes:FindFirstChild(name)
+
+        if object and object:IsA(className) then
+            return object
+        end
+        return nil
+    end
+
+    local function ReadJson(attribute)
+        local raw = LocalPlayer:GetAttribute(attribute)
+        local cached = jsonCache[attribute]
+
+        if cached and cached.Raw == raw then
+            return cached.Data
+        end
+
+        local data
+        if type(raw) == "string" and raw ~= "" then
+            local ok, result = pcall(function()
+                return HttpService:JSONDecode(raw)
+            end)
+
+            if ok and type(result) == "table" then
+                data = result
+            end
+        end
+
+        jsonCache[attribute] = { Raw = raw, Data = data }
+        return data
+    end
+
+    local function ReadModule(name)
+        local shared = RS:FindFirstChild("Shared")
+        local object = shared and shared:FindFirstChild(name)
+
+        if not object or not object:IsA("ModuleScript") then
+            return nil
+        end
+
+        local cached = moduleCache[name]
+        if cached and cached.Object == object then
+            if cached.Data then return cached.Data end
+            if os.clock() < cached.RetryAt then return nil end
+        end
+
+        local ok, result = pcall(require, object)
+        local data = ok and type(result) == "table" and result or nil
+
+        moduleCache[name] = {
+            Object = object,
+            Data = data,
+            RetryAt = os.clock() + 10,
+        }
+        return data
+    end
+
+    -- ค่าลองซ้ำของสคริปต์ ไม่ใช่ rate limit ที่ยืนยันจาก Server
+    local function RequestClaim(key, remoteName, args, label)
+        local now = os.clock()
+        local previous = attempts[key]
+
+        if previous and (
+            previous.Count >= 3 or now < previous.RetryAt
+        ) then
+            return false
+        end
+
+        local remote = FindRemote(remoteName, "RemoteEvent")
+        if not remote then
+            label:SetValue("รอ " .. remoteName)
+            return false
+        end
+
+        local count = previous and previous.Count + 1 or 1
+        attempts[key] = {
+            Count = count,
+            RetryAt = now + 10,
+        }
+
+        remote:FireServer(table.unpack(args, 1, args.n))
+        label:SetValue("ส่งคำขอ: " .. key .. " | " .. count .. "/3")
+        return true
+    end
+
+    local function CollectFreeRewards()
+        local daily = ReadJson("DailyJson")
+
+        if daily and daily.CanClaim == true
+            and Finite(daily.Day) then
+            if RequestClaim(
+                "daily:" .. tostring(daily.Day),
+                "DailyClaim",
+                table.pack(),
+                rewardStatus
+            ) then return true end
+        end
+
+        local data = ReadJson("RewardsJson")
+        if not data then return false end
+
+        local online = data.Online
+        local definitions = ReadModule("RewardData")
+
+        if type(online) == "table"
+            and type(online.Got) == "table"
+            and Finite(online.Sec)
+            and definitions
+            and type(definitions.Online) == "table" then
+
+            local elapsed = 0
+            if Finite(online.At) then
+                elapsed = math.max(
+                    0, workspace:GetServerTimeNow() - online.At
+                )
+            end
+
+            local seconds = online.Sec + math.min(elapsed, 75)
+
+            for index = 1, 6 do
+                local def = definitions.Online[index]
+
+                if type(def) == "table"
+                    and Finite(def.Minutes) and def.Minutes >= 0
+                    and not table.find(online.Got, index)
+                    and seconds >= def.Minutes * 60 then
+                    if RequestClaim(
+                        "online:" .. index,
+                        "RewardAction",
+                        table.pack("online", index),
+                        rewardStatus
+                    ) then return true end
+                end
+            end
+        end
+
+        local c8 = data.C8
+        if type(c8) == "table" and c8.Can == true
+            and Finite(c8.Day)
+            and c8.Day >= 1 and c8.Day <= 8
+            and c8.Day % 1 == 0 then
+            if RequestClaim(
+                "c8:" .. c8.Day,
+                "RewardAction",
+                table.pack("c8", nil),
+                rewardStatus
+            ) then return true end
+        end
+
+        local month = data.Month
+        if type(month) == "table"
+            and type(month.Days) == "table"
+            and Finite(month.Today)
+            and month.Today >= 1 and month.Today <= 31
+            and month.Today % 1 == 0
+            and not table.find(month.Days, month.Today) then
+
+            local monthKey = os.date(
+                "!%Y-%m", workspace:GetServerTimeNow()
+            )
+
+            if RequestClaim(
+                "month:" .. monthKey .. ":" .. month.Today,
+                "RewardAction",
+                table.pack("month", nil),
+                rewardStatus
+            ) then return true end
+        end
+
+        return false
+    end
+
+    local function CollectBook()
+        local data = ReadJson("AchieveJson")
+        local definitions = ReadModule("AchievementData")
+        local level = LocalPlayer:GetAttribute("Level")
+
+        if not data or type(data.Got) ~= "table"
+            or type(data.C) ~= "table"
+            or not definitions
+            or type(definitions.List) ~= "table" then
+            return false
+        end
+
+        for _, def in pairs(definitions.List) do
+            if type(def) ~= "table"
+                or type(def.Id) ~= "string"
+                or type(def.Type) ~= "string"
+                or not Finite(def.Count)
+                or data.Got[def.Id] == true then
+                continue
+            end
+
+            local progress
+            if def.Type == "level" then
+                progress = level
+            else
+                progress = data.C[def.Type]
+                if progress == nil then progress = 0 end
+            end
+
+            if Finite(progress) and progress >= def.Count then
+                if RequestClaim(
+                    "book:" .. def.Id,
+                    "AchieveAction",
+                    table.pack("claim", def.Id, false),
+                    bookStatus
+                ) then return true end
+            end
+        end
+
+        return false
+    end
+
+    local function ResetAttempts(prefix)
+        for key in pairs(attempts) do
+            if key:sub(1, #prefix) == prefix then
+                attempts[key] = nil
+            end
+        end
+        nextScan = 0
+    end
+
+    rewardsSection:AddToggle("ZeroXAutoCollectReward", {
+        Title = "Auto Collect Reward",
+        Description = "รับ Daily Login, Online Reward, "
+            .. "เช็กอิน 8 วัน และปฏิทินรายเดือน เฉพาฐส่วนฟรี",
+        Default = false,
+
+        Callback = function(value)
+            rewardsEnabled = value == true
+
+            ResetAttempts("daily:")
+            ResetAttempts("online:")
+            ResetAttempts("c8:")
+            ResetAttempts("month:")
+
+            rewardStatus:SetValue(
+                rewardsEnabled and "รอตรวจรางวัล" or "ปิดใช้งาน"
+            )
+        end,
+    })
+
+    bookSection:AddToggle("ZeroXAutoCollectAdventureBook", {
+        Title = "Auto Collect Adventure Book",
+        Description = "รับรายการที่ทำครบเงื่อน็ขแล้ว "
+            .. "ไม่เปลี่ยน Title ที่กำลังใช้งาน",
+        Default = false,
+
+        Callback = function(value)
+            bookEnabled = value == true
+            ResetAttempts("book:")
+
+            bookStatus:SetValue(
+                bookEnabled and "รอตรวจสมุดผจญภัย" or "ปิดใช้งาน"
+            )
+        end,
+    })
+
+
+    for _, attribute in ipairs({
+        "DailyJson", "RewardsJson", "AchieveJson",
+        "AchieveReady", "Level",
+    }) do
+        table.insert(connections,
+            LocalPlayer:GetAttributeChangedSignal(attribute):Connect(
+                function()
+                    nextScan = 0
+                end
+            )
+        )
+    end
+
+    local worker = task.defer(function()
+        local ok, err = xpcall(function()
+            while alive do
+                local now = os.clock()
+
+                if now >= nextScan then
+                    nextScan = now + 1
+
+                    if CharacterAlive() then
+                        local sent = rewardsEnabled
+                            and CollectFreeRewards()
+
+                        if not sent and bookEnabled then
+                            CollectBook()
+                        end
+                    end
+                end
+
+                task.wait(0.25)
+            end
+        end, debug.traceback)
+
+        if not ok and alive then
+            rewardsEnabled = false
+            bookEnabled = false
+            rewardStatus:SetValue("Error: " .. tostring(err))
+        end
+    end)
+
+    MacUI:OnUnload(function()
+        alive = false
+        rewardsEnabled = false
+        bookEnabled = false
+
+        task.cancel(worker)
+
+        for _, connection in ipairs(connections) do
+            connection:Disconnect()
+        end
+    end)
 end
 
 -- Keep the original settings folders and custom theme loading.
