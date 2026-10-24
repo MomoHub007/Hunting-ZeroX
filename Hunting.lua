@@ -1474,6 +1474,9 @@ end
 -- Connect callbacks only after the real game functions are available.
 --------------------------------------------------------------------------------
 
+local farmWalkSpeedActive = false
+local refreshFarmWalkSpeed
+
 do
     local function InitHuntingFarm()
         local RS = game:GetService("ReplicatedStorage")
@@ -1547,11 +1550,8 @@ do
         local bossDodgeActive = false
         local ResetBossDodge
         local sellTripActive = false
-        local pullEnabled = false
         local farmPullActive = false
         local pullSession
-        local pullNextScan = 0
-        local pullCount = 3
 
         -- นโยบายของระบบใหม่ ไม่ใช่ค่ารับประกัน Leash ของเกม
         local PULL_RADIUS = 60
@@ -1583,7 +1583,9 @@ do
         local REPOSITION_DISTANCE = 0.75
         local WAIT_HEIGHT = 4
         local FARM_HOVER_HEIGHT = 30
-        local farmMovement = "Teleport"
+        local farmMovement = "Walk"
+        local nativeFarmIds
+        local nativeFarmAttackLeader = false
         local farmWalkActive = false
 
         local FarmTab = Tabs.AutoFarm
@@ -1599,10 +1601,6 @@ do
             Icon = "swords",
         })
 
-        local pullSection = FarmTab:AddSection({
-            Title = "Monster Pulling",
-            Icon = "swords",
-        })
 
         local recoverySection = FarmTab:AddSection({
             Title = "Recovery & Loot",
@@ -1778,11 +1776,6 @@ do
             if not nativeWalkOwned then return end
             nativeWalkOwned = false
 
-            -- Auto Use Skill ยังต้องใช้ Native Auto
-            local skillOption = Options.ZeroXAutoUseSkill
-            if skillOption and skillOption.Value == true then
-                return
-            end
 
             local menu = LocalPlayer:FindFirstChild("LumiMenuToggle")
 
@@ -1818,8 +1811,59 @@ do
                 return false
             end
 
-            -- ยืนยันจากสถานะที่เกมส่งกลับแล้วเท่านั้น
-            if settings.FixedArea == false then
+            local lootOption = Options.ZeroXAutoCollectDrop
+            local boxOption = Options.ZeroXAutoOpenChest
+
+            -- ให้ตัวเก็บของของสคริปต์รับผิดชอบการเดิน
+            local wantLoot = false
+            -- ตัวเปิดกล่องของสคริปต์เป็นผู้เดินและกด E เอง
+            local wantBoxes = false
+
+            if type(nativeFarmIds) ~= "table"
+                or next(nativeFarmIds) == nil then
+                walkInfo:SetValue("Waiting for farm monster plan")
+                return false
+            end
+
+            local onlyMatches = type(settings.Only) == "table"
+            local exclusionsClear = type(settings.Exclude) == "table"
+
+            if onlyMatches then
+                for id, selected in pairs(nativeFarmIds) do
+                    if settings.Only[id] ~= selected then
+                        onlyMatches = false
+                        break
+                    end
+                end
+            end
+
+            if onlyMatches then
+                for id, selected in pairs(settings.Only) do
+                    if selected == true
+                        and nativeFarmIds[id] ~= true then
+                        onlyMatches = false
+                        break
+                    end
+                end
+            end
+
+            if exclusionsClear then
+                for id in pairs(nativeFarmIds) do
+                    if settings.Exclude[id] ~= nil then
+                        exclusionsClear = false
+                        break
+                    end
+                end
+            end
+
+            if settings.FixedArea == false
+                and settings.Loot == wantLoot
+                and settings.OpenBoxes == wantBoxes
+                and settings.Mode == "fight"
+                and settings.NormalAttack == true
+                and settings.AttackLeader == nativeFarmAttackLeader
+                and onlyMatches
+                and exclusionsClear then
                 return true
             end
 
@@ -1836,8 +1880,28 @@ do
             if now - lastRoamRequest >= 1 then
                 lastRoamRequest = now
 
-                -- เปลี่ยนเฉพาะ FixedArea ส่งฟิลด์อื่นกลับครบ
                 settings.FixedArea = false
+                settings.Loot = wantLoot
+                settings.OpenBoxes = wantBoxes
+
+                settings.Mode = "fight"
+                settings.NormalAttack = true
+                settings.AttackLeader = nativeFarmAttackLeader
+
+                settings.Only = table.clone(nativeFarmIds)
+
+                -- เก็บข้อยกเว้นมอนอื่นไว้
+                -- เอาออกเฉพาะมอนที่แผนฟาร์มต้องโจมตี
+                local exclude = type(settings.Exclude) == "table"
+                    and table.clone(settings.Exclude)
+                    or {}
+
+                for id in pairs(nativeFarmIds) do
+                    exclude[id] = nil
+                end
+
+                settings.Exclude = exclude
+
                 setBotSettings:FireServer(settings)
             end
 
@@ -2097,9 +2161,78 @@ do
             end
         end
 
+        local cachedActionZone
+        local lastActionZoneScan = -math.huge
+
+        local function InsideActionZone(zone, position)
+            if not zone or not zone:IsA("BasePart")
+                or not zone.Parent then
+                return false
+            end
+
+            local point = zone.CFrame:PointToObjectSpace(position)
+
+            -- ใช้ขอบโซนจริง ไม่เพิ่มระยะเผื่อข้ามโซน
+            return math.abs(point.X) <= zone.Size.X / 2
+                and math.abs(point.Z) <= zone.Size.Z / 2
+        end
+
+        local function GetActionZone()
+            local character = LocalPlayer.Character
+            local humanoid = character
+                and character:FindFirstChildOfClass("Humanoid")
+            local root = humanoid and humanoid.RootPart
+            local zoneFolder = workspace:FindFirstChild("Zones")
+
+            if not humanoid or humanoid.Health <= 0
+                or not root or not root:IsA("BasePart")
+                or not root.Parent or not zoneFolder then
+                cachedActionZone = nil
+                return nil
+            end
+
+            -- อยู่โซนเดิม ไม่ต้องสแกนรายการซ้ำ
+            if cachedActionZone
+                and cachedActionZone.Parent == zoneFolder
+                and InsideActionZone(cachedActionZone, root.Position) then
+                return cachedActionZone
+            end
+
+            cachedActionZone = nil
+
+            local now = os.clock()
+            if now - lastActionZoneScan < 0.2 then
+                return nil
+            end
+            lastActionZoneScan = now
+
+            for _, zone in ipairs(zoneFolder:GetChildren()) do
+                if zone:IsA("BasePart")
+                    and InsideActionZone(zone, root.Position) then
+                    cachedActionZone = zone
+                    return zone
+                end
+            end
+
+            -- อยู่สะพาน/นอกขอบ/โซนยังไม่โหลด ให้พักทั้งสามระบบ
+            return nil
+        end
+
+        local function InCurrentActionZone(position)
+            local zone = GetActionZone()
+            return zone ~= nil and InsideActionZone(zone, position)
+        end
+
         local function PumpkinCandidate(model, level)
             local part = GetMonsterPart(model)
             if not part then return nil end
+
+            local currentZone = GetActionZone()
+
+            if not currentZone
+                or not InsideActionZone(currentZone, part.Position) then
+                return nil
+            end
 
             local id = model:GetAttribute("MonsterId")
             local def = type(id) == "string" and monsterData[id]
@@ -2110,6 +2243,10 @@ do
                 or not zone
                 or not CanAccess(zone, level)
                 or not gatesValid then
+                return nil
+            end
+
+            if zone.Id ~= currentZone.Name then
                 return nil
             end
 
@@ -2608,16 +2745,6 @@ do
             return nil
         end
 
-        local nativeAutoSkillRemote = FindRequired(
-            remotes,
-            "SetAutoSkill",
-            "RemoteEvent"
-        )
-        local nativeAutoMenu = FindRequired(
-            LocalPlayer,
-            "LumiMenuToggle",
-            "BindableEvent"
-        )
 
         -- รับช่วงร่ายของเกม เพื่อให้ Auto Farm พักการย้ายตำแหน่ง
         local skillCastUntil = 0
@@ -2672,56 +2799,9 @@ do
         end
 
         local function ResetPull(restoreNative)
-            local old = pullSession
             pullSession = nil
             farmPullActive = false
-            pullNextScan = os.clock() + 3
             StopFarmHover()
-
-            if not old then return end
-
-            if old.HitConnection then
-                old.HitConnection:Disconnect()
-                old.HitConnection = nil
-            end
-
-            if LocalPlayer.Character == old.Character then
-                local humanoid =
-                    old.Character:FindFirstChildOfClass("Humanoid")
-
-                if humanoid and humanoid.Health > 0 then
-                    humanoid:Move(Vector3.zero, false)
-                end
-            end
-
-            if restoreNative and alive and not potionTripActive
-                and old.AutoWasOn
-                and LocalPlayer.Character == old.Character then
-
-                local menu = LocalPlayer:FindFirstChild("LumiMenuToggle")
-                if menu and menu:IsA("BindableEvent")
-                    and LocalPlayer:GetAttribute("AutoOn") ~= true then
-                    menu:Fire("autoToggle")
-                end
-            end
-        end
-
-        local function IsPullable(model, eligible)
-            local part = eligible(model)
-            if not part or model:GetAttribute("IsDummy") == true then
-                return nil
-            end
-
-            local id = model:GetAttribute("MonsterId")
-            local def = type(id) == "string" and monsterData[id]
-
-            if type(def) ~= "table"
-                or def.Ranged == true
-                or not IsRegular(id, model) then
-                return nil
-            end
-
-            return part
         end
 
         -- ระยะเผื่อขอบที่สคริปต์กำหนดเอง
@@ -2863,492 +2943,6 @@ do
             end
 
             return nil
-        end
-
-        local function StepPull(eligible, character, humanoid, root, zone)
-            local now = os.clock()
-
-            if not pullEnabled then
-                if pullSession then
-                    ResetPull(true)
-                    ClearTarget()
-                end
-                return false
-            end
-
-            if not pullSession then
-                -- ต้องมีมอนหลักที่ Auto Farm กำลังโจมตีอยู่ก่อน
-                if not target or not eligible(target) or not holding then
-                    return false
-                end
-
-                local mainTarget = target
-
-                if now < pullNextScan then return false end
-                pullNextScan = now + 2
-
-                local spatialZone = FindPullZone(root.Position)
-                if not spatialZone then return false end
-
-                local candidates = {}
-
-                for model in pairs(monsters) do
-                    local part = IsPullable(model, eligible)
-
-                    if part then
-                        local threat = model:GetAttribute("ThreatUserId")
-                        local distance =
-                            (part.Position - root.Position).Magnitude
-
-                        if model ~= mainTarget
-                            and (threat == nil or threat == 0)
-                            and distance <= PULL_RADIUS
-                            and InsidePullZone(spatialZone, part.Position) then
-
-                            table.insert(candidates, {
-                                Model = model,
-                                Distance = distance,
-                            })
-                        end
-                    end
-                end
-
-                if #candidates == 0 then
-                    return false -- มอนน้อย ใช้ฟาร์มเดิม
-                end
-
-                table.sort(candidates, function(a, b)
-                    return a.Distance < b.Distance
-                end)
-
-                local menu = LocalPlayer:FindFirstChild("LumiMenuToggle")
-                local autoOn = LocalPlayer:GetAttribute("AutoOn") == true
-
-                if autoOn and not (
-                    menu and menu:IsA("BindableEvent")
-                ) then
-                    return false
-                end
-
-                local queue = {}
-                for index = 1, math.min(
-                    math.max(1, pullCount - 1),
-                    #candidates
-                ) do
-                    table.insert(queue, candidates[index].Model)
-                end
-
-                pullSession = {
-                    Character = character,
-                    Folder = folder,
-                    Map = workspace:FindFirstChild("Map"),
-                    Zone = spatialZone,
-                    ZoneId = zone.Id,
-                    Mode = mode,
-                    SelectedId = selectedId,
-                    MainTarget = mainTarget,
-                    Anchor = root.Position,
-                    AnchorCFrame = root.CFrame,
-                    Queue = queue,
-                    -- จำมอนหลักรวมอยู่ในชุดที่ต้องจัดการ
-                    Tagged = {
-                        [mainTarget] = true,
-                    },
-                    Index = 1,
-                    Phase = "Pull",
-                    StartedAt = now,
-                    TargetAt = now,
-                    SentAt = nil,
-                    AutoWasOn = autoOn,
-                }
-
-                farmPullActive = true
-                ClearTarget()
-
-                HoldFarmPosition(
-                    humanoid,
-                    root,
-                    root.Position,
-                    root.CFrame
-                )
-
-                if autoOn then
-                    menu:Fire("autoToggle")
-                end
-
-                SetStatus("Pull: pausing native Auto")
-                return true
-            end
-
-            local session = pullSession
-
-            if session.Character ~= character
-                or session.Folder ~= folder
-                or session.Map ~= workspace:FindFirstChild("Map")
-                or not session.Zone.Parent
-                or session.ZoneId ~= zone.Id
-                or session.Mode ~= mode
-                or session.SelectedId ~= selectedId
-                or not InsidePullZone(session.Zone, root.Position)
-                or (root.Position - session.Anchor).Magnitude
-                    > PULL_RADIUS + 15 then
-
-                ResetPull(true)
-                ClearTarget()
-                return true
-            end
-
-            if session.Phase == "Fight" then
-                local remaining = 0
-                local fightTarget
-                local nearestDistance = math.huge
-
-                -- จัดการเฉพาะชุดเดิม ไม่ค้นหามอนชุดใหม่
-                for model in pairs(session.Tagged) do
-                    local hp = tonumber(model:GetAttribute("HP"))
-
-                    if hp and hp <= 0 then
-                        session.Tagged[model] = nil
-                    else
-                        remaining += 1
-
-                        local part = eligible(model)
-
-                        if part then
-                            -- ตีตัวเดิมต่อจนตาย ก่อนเปลี่ยนตัว
-                            if model == target then
-                                fightTarget = model
-                            elseif not fightTarget
-                                or fightTarget ~= target then
-                                local distance =
-                                    (part.Position - root.Position).Magnitude
-
-                                if distance < nearestDistance then
-                                    nearestDistance = distance
-                                    fightTarget = model
-                                end
-                            end
-                        end
-                    end
-                end
-
-                if remaining == 0 then
-                    ResetPull(true)
-                    ClearTarget()
-                    SetStatus("Pull: pack cleared; ready for next pull")
-                    return true
-                end
-
-                if not fightTarget then
-                    -- การหายจาก Client ไม่ยืนยันว่ามอนตาย
-                    -- จึงไม่เริ่มลากชุดใหม่จากเหตุนี้
-                    if target then
-                        ClearTarget()
-                    end
-
-                    HoldFarmPosition(
-                        humanoid, root, root.Position, root.CFrame
-                    )
-
-                    SetStatus(
-                        "Pull: waiting for remaining pack to load"
-                    )
-                    return true
-                end
-
-                return false, fightTarget
-            end
-
-            -- มอนหลักตายระหว่างลาก ให้หยุดลากเพิ่ม
-            -- แล้วจัดการมอนที่สะกิดมาแล้วก่อน
-            if not eligible(session.MainTarget) then
-                session.Index = #session.Queue + 1
-            end
-
-            if LocalPlayer:GetAttribute("AutoOn") == true then
-                if now - session.StartedAt >= 5 then
-                    ResetPull(true)
-                    ClearTarget()
-                    SetStatus("Pull cancelled: native Auto remained active")
-                end
-                return true
-            end
-
-            if session.Phase == "Pull" then
-                local model = session.Queue[session.Index]
-
-                if not model then
-                    ClearTarget()
-                    session.Phase = "Fight"
-                    farmPullActive = false
-
-                    if session.AutoWasOn then
-                        local menu =
-                            LocalPlayer:FindFirstChild("LumiMenuToggle")
-
-                        if menu and menu:IsA("BindableEvent")
-                            and LocalPlayer:GetAttribute("AutoOn") ~= true then
-                            menu:Fire("autoToggle")
-                        end
-                    end
-
-                    if session.HitConnection then
-                        session.HitConnection:Disconnect()
-                        session.HitConnection = nil
-                    end
-
-                    SetStatus(
-                        "Pull: finishing current pack before pulling again"
-                    )
-
-                    -- รอบหน้าจะเลือกจาก Tagged เท่านั้น
-                    return true
-                end
-
-                local part = IsPullable(model, eligible)
-                local threat = part and model:GetAttribute("ThreatUserId")
-
-                local skip = not part
-                    or (part and (
-                        not InsidePullZone(session.Zone, part.Position)
-                        or (part.Position - session.Anchor).Magnitude
-                            > PULL_RADIUS + 10
-                    ))
-                    or (threat ~= nil and threat ~= 0
-                        and threat ~= LocalPlayer.UserId)
-
-                if threat == LocalPlayer.UserId and part then
-                    session.Tagged[model] = true
-                end
-
-                if skip
-                    or session.HitObserved
-                    or now - session.TargetAt >= PULL_APPROACH_TIMEOUT
-                    or (session.SentAt
-                        and now - session.SentAt >= PULL_THREAT_TIMEOUT) then
-
-                    -- เก็บตัวที่เห็น HP ลด หรือยืนยันว่ากำลังตามเรา
-                    if part and (
-                        session.HitObserved
-                        or threat == LocalPlayer.UserId
-                    ) then
-                        session.Tagged[model] = true
-                    end
-
-                    if session.HitConnection then
-                        session.HitConnection:Disconnect()
-                        session.HitConnection = nil
-                    end
-
-                    ClearTarget()
-
-                    HoldFarmPosition(
-                        humanoid, root, root.Position, root.CFrame
-                    )
-
-                    session.Index = session.Index + 1
-                    session.TargetAt = now
-                    session.SentAt = nil
-                    session.HitObserved = false
-                    return true
-                end
-
-                local range = classRange.Attack(LocalPlayer)
-                local inside = classRange.StopInside(LocalPlayer)
-
-                if type(range) ~= "number"
-                    or type(inside) ~= "number"
-                    or range <= inside then
-                    ResetPull(true)
-                    ClearTarget()
-                    return true
-                end
-
-                local radius = model:GetAttribute("Radius")
-                if type(radius) ~= "number" then radius = 1.5 end
-                radius = math.max(radius, 0)
-
-                local attackLimit = range - inside
-                local reach = math.max(
-                    0.5,
-                    attackLimit + radius - RANGE_MARGIN
-                )
-
-                -- ล็อกทิศด้านหลังครั้งแรกของมอนแต่ละตัว
-                -- ไม่หมุนไล่ตามการหันของมอน
-                if session.HoverIndex ~= session.Index
-                    or not session.HoverDirection then
-
-                    local look = part.CFrame.LookVector
-                    local direction =
-                        Vector3.new(-look.X, 0, -look.Z)
-
-                    if direction.Magnitude <= 0.01 then
-                        SetStatus("Pull: waiting for monster facing")
-                        return true
-                    end
-
-                    session.HoverIndex = session.Index
-                    session.HoverDirection = direction.Unit
-                end
-
-                local height = math.min(
-                    FARM_HOVER_HEIGHT,
-                    reach * 0.4
-                )
-
-                local horizontalDistance = math.sqrt(
-                    math.max(0, reach * reach - height * height)
-                )
-
-                local destination = part.Position
-                    + session.HoverDirection * horizontalDistance
-                    + Vector3.new(0, height, 0)
-
-                destination = SafeFarmDestination(
-                    zone.Id, part.Position, destination, reach
-                )
-
-                if destination then
-                    local offset = destination - part.Position
-                    local flat = Vector3.new(offset.X, 0, offset.Z)
-
-                    if flat.Magnitude > 0.01 then
-                        session.HoverDirection = flat.Unit
-                    end
-                end
-
-                -- คงข้อจำกัดโซนและระยะลากเดิม
-                if not destination
-                    or not InsidePullZone(session.Zone, destination)
-                    or (destination - session.Anchor).Magnitude
-                        > PULL_RADIUS + 15 then
-
-                    ClearTarget()
-
-                    HoldFarmPosition(
-                        humanoid, root, root.Position, root.CFrame
-                    )
-
-                    session.Index += 1
-                    session.TargetAt = now
-                    session.SentAt = nil
-                    session.HitObserved = false
-                    return true
-                end
-
-                local facing = CFrame.lookAt(
-                    destination,
-                    Vector3.new(
-                        part.Position.X,
-                        destination.Y,
-                        part.Position.Z
-                    )
-                )
-
-                -- ClearTarget ลบ Hover จึงเรียกก่อนติดตั้ง Hover ใหม่
-                if not session.SentAt and target ~= model then
-                    ClearTarget()
-                end
-
-                humanoid:Move(Vector3.zero, false)
-
-                local distance =
-                    (part.Position - root.Position).Magnitude - radius
-
-                if distance > attackLimit
-                    or (root.Position - destination).Magnitude
-                        > REPOSITION_DISTANCE then
-
-                    root.CFrame = facing
-                    root.AssemblyLinearVelocity = Vector3.zero
-                    root.AssemblyAngularVelocity = Vector3.zero
-                end
-
-                HoldFarmPosition(
-                    humanoid, root, destination, facing
-                )
-
-                session.HoverPosition = destination
-                session.HoverFacing = facing
-
-                -- ตรวจระยะจริงหลังจัดตำแหน่ง
-                distance =
-                    (part.Position - root.Position).Magnitude - radius
-
-                if distance > attackLimit then
-                    SetStatus("Pull: hovering; waiting for attack range")
-                    return true
-                end
-
-                if not session.SentAt then
-                    local tracker = GetTracker()
-                    if not tracker then return true end
-
-                    local beforeHP =
-                        tonumber(model:GetAttribute("HP"))
-
-                    if not beforeHP or beforeHP <= 0 then
-                        return true
-                    end
-
-                    target = model
-                    tracker.Value = model
-                    session.SentAt = now
-                    session.HitObserved = false
-                    holding = true
-
-                    if session.HitConnection then
-                        session.HitConnection:Disconnect()
-                    end
-
-                    local watchedIndex = session.Index
-
-                    session.HitConnection =
-                        model:GetAttributeChangedSignal("HP"):Connect(function()
-                            if not alive or pullSession ~= session
-                                or session.Phase ~= "Pull"
-                                or session.Index ~= watchedIndex
-                                or session.HitObserved then
-                                return
-                            end
-
-                            local currentHP =
-                                tonumber(model:GetAttribute("HP"))
-
-                            if currentHP and currentHP < beforeHP then
-                                session.HitObserved = true
-
-                                if session.HitConnection then
-                                    session.HitConnection:Disconnect()
-                                    session.HitConnection = nil
-                                end
-
-                                -- หยุดตี แต่คงตำแหน่งลอยระหว่างเปลี่ยนตัว
-                                ClearTarget()
-
-                                if root.Parent and humanoid.Health > 0
-                                    and LocalPlayer.Character == character
-                                    and farmPullActive
-                                    and session.HoverPosition
-                                    and session.HoverFacing then
-
-                                    HoldFarmPosition(
-                                        humanoid,
-                                        root,
-                                        session.HoverPosition,
-                                        session.HoverFacing
-                                    )
-                                end
-                            end
-                        end)
-
-                    setTarget:FireServer(model, false, true)
-                    SetStatus("Pull: waiting for first HP decrease")
-                end
-
-                return true
-            end
         end
 
         Connect(LocalPlayer.CharacterRemoving, function()
@@ -3981,6 +3575,21 @@ do
             Connect(bossFx.OnClientEvent, function(
                 action, bossName, skillName, zonesData, duration
             )
+                -- รับเป้าที่ Native Auto เพิ่งเลือก
+                -- ไม่เปลี่ยนผู้ร่ายระหว่างกำลังหลบ
+                if alive and enabled and dodgeEnabled
+                    and farmMovement == "Walk"
+                    and not bossDodgeActive then
+
+                    local tracker = GetTracker()
+                    local nativeTarget = tracker and tracker.Value
+
+                    target = nativeTarget
+                        and GetMonsterPart(nativeTarget)
+                        and nativeTarget
+                        or nil
+                end
+
                 if not alive or not enabled or not dodgeEnabled
                     or not target or not GetMonsterPart(target)
                     or potionTripActive or sellTripActive
@@ -4033,10 +3642,13 @@ do
                     for _, event in ipairs(dodgeEvents) do
                         if event.Key == key and not event.Hit then
                             event.Hit = true
-                            event.Expires = now + math.max(
-                                DODGE_SETTLE,
-                                duration,
-                                event.PoolDuration or 0
+                            event.Expires = math.max(
+                                event.Expires,
+                                now + math.max(
+                                    DODGE_SETTLE,
+                                    duration,
+                                    event.PoolDuration or 0
+                                )
                             )
                             break
                         end
@@ -4121,7 +3733,9 @@ do
                     Key = key,
                     Zones = snapshot,
                     Inner = skill.Shape == "donut" and skill.Inner or nil,
-                    Expires = now + duration + DODGE_SETTLE,
+                    -- เวลาสิ้นสุดสำรอง กรณีไม่มี hit/cancel ตามมา
+                    Expires = now + duration
+                        + poolDuration + DODGE_SETTLE,
                     PoolDuration = poolDuration,
                 })
             end)
@@ -4139,8 +3753,9 @@ do
             local now = os.clock()
             for index = #dodgeEvents, 1, -1 do
                 local event = dodgeEvents[index]
+
                 if event.Boss ~= model
-                    or (event.Hit and now >= event.Expires) then
+                    or now >= event.Expires then
                     table.remove(dodgeEvents, index)
                 end
             end
@@ -4468,6 +4083,194 @@ do
                     <= bounds.HalfZ - DODGE_MARGIN
         end
 
+        local CancelNativeFarmNav
+        local StepNativeFarmPlan
+
+        do
+            local nativeNavRequest
+            local farmInputService =
+                game:GetService("UserInputService")
+
+            local manualWalkPending = false
+            local lastManualWalkAt = -math.huge
+            local WALK_RESUME_DELAY = 1
+
+            local farmMoveKeys = {
+                Enum.KeyCode.W,
+                Enum.KeyCode.A,
+                Enum.KeyCode.S,
+                Enum.KeyCode.D,
+            }
+
+            Connect(farmInputService.InputBegan, function(input, processed)
+                if processed or not alive or not enabled
+                    or farmMovement ~= "Walk"
+                    or farmInputService:GetFocusedTextBox() then
+                    return
+                end
+
+                if table.find(farmMoveKeys, input.KeyCode) then
+                    manualWalkPending = true
+                    lastManualWalkAt = os.clock()
+                end
+            end)
+
+            function CancelNativeFarmNav()
+                local request = nativeNavRequest
+                nativeNavRequest = nil
+                manualWalkPending = false
+
+                -- ยกเลิกเฉพาะเส้นทางที่สคริปต์เป็นผู้สั่ง
+                if request
+                    and LocalPlayer:GetAttribute("QuestNavId")
+                        == request.Value then
+                    LocalPlayer:SetAttribute("QuestNavId", "")
+                end
+            end
+
+            Connect(LocalPlayer.CharacterAdded, CancelNativeFarmNav)
+            MacUI:OnUnload(CancelNativeFarmNav)
+
+            function StepNativeFarmPlan(zone, ids, tracker, root)
+                if manualWalkPending then
+                    local now = os.clock()
+                    local keyHeld = false
+
+                    if not farmInputService:GetFocusedTextBox() then
+                        for _, key in ipairs(farmMoveKeys) do
+                            if farmInputService:IsKeyDown(key) then
+                                keyHeld = true
+                                break
+                            end
+                        end
+                    end
+
+                    if keyHeld then
+                        lastManualWalkAt = now
+                        SetStatus("Native Walk: manual movement")
+                        return
+                    end
+
+                    if now - lastManualWalkAt < WALK_RESUME_DELAY then
+                        SetStatus("Native Walk: waiting to resume")
+                        return
+                    end
+
+                    local current =
+                        LocalPlayer:GetAttribute("QuestNavId")
+                    local request = nativeNavRequest
+
+                    -- ไม่แทรกเส้นทางใหม่ที่ผู้เล่นเลือกเอง
+                    if current == nil or current == ""
+                        or (request and current == request.Value) then
+                        CancelNativeFarmNav()
+                        -- โค้ดด้านล่างจะสร้างคำขอเดินใหม่
+                    else
+                        manualWalkPending = false
+                    end
+                end
+
+                StopFarmHover()
+
+                if partyFarmEnabled then
+                    CancelNativeFarmNav()
+                    SetStatus("Native Walk: party navigation unavailable")
+                    return
+                end
+
+                if not CanAccess(
+                    zone,
+                    LocalPlayer:GetAttribute("Level")
+                ) then
+                    CancelNativeFarmNav()
+                    SetStatus("Native Walk: level requirement")
+                    return
+                end
+
+                -- เลือกจากแผนฟาร์มที่สร้างจากข้อมูลเกมจริง
+                local choices = {}
+                for id, selected in pairs(ids or {}) do
+                    if selected and type(id) == "string"
+                        and type(monsterData[id]) == "table" then
+                        table.insert(choices, id)
+                    end
+                end
+                table.sort(choices)
+
+                local id = choices[1]
+                if not id then
+                    CancelNativeFarmNav()
+                    SetStatus("Native Walk: no monster in plan")
+                    return
+                end
+
+                local value = "mon:" .. id
+                local request = nativeNavRequest
+
+                if request and (
+                    request.Zone ~= zone.Id
+                    or request.Value ~= value
+                ) then
+                    CancelNativeFarmNav()
+                    request = nil
+                end
+
+                if not request then
+                    local current =
+                        LocalPlayer:GetAttribute("QuestNavId")
+
+                    -- ไม่เขียนทับเส้นทางที่ผู้เล่นสั่งเอง
+                    if current ~= nil and current ~= "" then
+                        SetStatus("Native Walk: another navigation is active")
+                        return
+                    end
+
+                    if not EnsureNativeRoam() then return end
+
+                    ResetPull(false)
+                    ClearTarget()
+
+                    nativeNavRequest = {
+                        Zone = zone.Id,
+                        Value = value,
+                    }
+
+                    LocalPlayer:SetAttribute("QuestNavId", value)
+                    SetStatus("Native navigation: " .. id)
+                    return
+                end
+
+                local current = LocalPlayer:GetAttribute("QuestNavId")
+
+                if current == request.Value then
+                    -- ระบบเกมเป็นผู้เดิน ข้ามสะพาน และจัดการทางตัน
+                    return
+                end
+
+                if current ~= nil and current ~= "" then
+                    SetStatus("Native Walk: another navigation is active")
+                    return
+                end
+
+                if not ZoneContains(zone, root.Position) then
+                    -- ไม่สั่งเส้นทางเดิมซ้ำเมื่อเกมหยุดเพราะทางตัน
+                    local note =
+                        LocalPlayer:GetAttribute("QuestNavNote")
+
+                    SetStatus(
+                        "Native navigation stopped: "
+                            .. (type(note) == "string"
+                                and note ~= "" and note
+                                or "destination not reached")
+                    )
+                    return
+                end
+
+                -- ถึงโซนแล้ว ให้ Native Auto เลือกเป้าและเดินต่อเอง
+                StepNativeFarmWalk(zone, nil, tracker, root)
+            end
+        end
+
         local function Step()
             if chestTripActive then
                 SetStatus("Opening chest: farming paused")
@@ -4539,12 +4342,211 @@ do
                 BuildPlan(level)
 
             if not zone then
+                CancelNativeFarmNav()
                 FinishFarmTravel(true)
                 ResetPull(true)
                 ClearTarget()
                 SetStatus(reason)
                 return
             end
+
+            nativeFarmIds = {}
+
+            nativeFarmAttackLeader = bossGateId ~= nil
+
+            for id, selected in pairs(ids or {}) do
+                if selected == true
+                    and type(id) == "string"
+                    and type(monsterData[id]) == "table" then
+
+                    nativeFarmIds[id] = true
+
+                    local def = monsterData[id]
+                    if def.Boss == true
+                        or def.MiniBoss == true
+                        or def.Leader == true
+                        or def.HalloweenPumpkin == true then
+                        nativeFarmAttackLeader = true
+                    end
+                end
+            end
+
+            if farmMovement == "Walk" then
+                -- ไม่ให้เส้นทางเดินเดิมแทรกระหว่างวาปเปลี่ยนโซน
+                CancelNativeFarmNav()
+
+                if not CanAccess(zone, level) then
+                    FinishFarmTravel(false)
+                    SetStatus("Travel: level requirement")
+                    return
+                end
+
+                -- ใช้ระบบเดินทางเดิม:
+                -- ลองวาปตรง หากไม่ยืนยัน จะใช้เส้นทางข้ามทีละโซน
+                if not StepFarmTravel(
+                    zone,
+                    level,
+                    character,
+                    humanoid,
+                    root
+                ) then
+                    return
+                end
+
+            if partyFarmEnabled and partySearching then
+                local search = partySearch
+
+                if not search then
+                    ClearTarget()
+                    SetStatus("Party Search: preparing route")
+                    return
+                end
+
+                ResetPull(true)
+                ClearTarget()
+
+                humanoid:Move(Vector3.zero, false)
+
+                if farmMovement == "Walk" then
+                    StopFarmHover()
+                else
+                    HoldFarmPosition(
+                        humanoid,
+                        root,
+                        root.Position,
+                        root.CFrame
+                    )
+                end
+
+                -- โซนที่เคยรอโหลดแล้ว ใช้เป็นทางผ่าน
+                if search.Visited[zone.Id] then
+                    search.Advance = true
+                    SetStatus("Party Search: passing " .. zone.Id)
+                    return
+                end
+
+                if not search.ArrivedAt then
+                    search.ArrivedAt = os.clock()
+                end
+
+                local elapsed = os.clock() - search.ArrivedAt
+
+                SetStatus(string.format(
+                    "Party Search: %s | loading %.1f / %.1fs",
+                    zone.Id,
+                    elapsed,
+                    PARTY_SEARCH_WAIT
+                ))
+
+                if elapsed >= PARTY_SEARCH_WAIT then
+                    search.Visited[zone.Id] = true
+                    search.Advance = true
+                    search.ArrivedAt = nil
+                end
+
+                return
+            end
+
+            if partyFarmEnabled and partyFarmLeaderRoot
+                and partyFarmLeaderRoot.Parent
+                and partyFarmData
+                and partyFarmData.Leader ~= LocalPlayer.UserId then
+
+                local offset =
+                    root.Position - partyFarmLeaderRoot.Position
+
+                local distance = Vector3.new(
+                    offset.X, 0, offset.Z
+                ).Magnitude
+
+                -- ตามเมื่อออกห่างมากพอ ไม่วาปตามทุก Tick
+                if distance > partyFarmRadius + 20 then
+                    ResetPull(true)
+                    ClearTarget()
+
+                    if isCasting then
+                        SetStatus("Party Farm: waiting for cast to finish")
+                        return
+                    end
+
+                    -- ใช้ตำแหน่งหัวหน้าที่โหลดจริง
+                    local destination = partyFarmLeaderRoot.Position
+                        + Vector3.new(0, 4, 0)
+
+                    local facing = CFrame.new(destination)
+                        * root.CFrame.Rotation
+
+                    humanoid:Move(Vector3.zero, false)
+                    root.CFrame = facing
+                    root.AssemblyLinearVelocity = Vector3.zero
+                    root.AssemblyAngularVelocity = Vector3.zero
+
+                    StopFarmHover()
+
+                    SetStatus("Party Farm: following leader")
+                    return
+                end
+            end
+
+
+                -- ระหว่างหลบต้องคงผู้ร่ายเดิมไว้
+                -- เพราะระบบ Dodge เคลียร์ CurrentTarget ตอนเริ่มหลบ
+                local combatTarget = dodgeSession
+                    and dodgeSession.Boss
+                    or tracker.Value
+
+                local combatPart = combatTarget
+                    and GetMonsterPart(combatTarget)
+
+                if not combatPart then
+                    if bossDodgeActive then
+                        ResetBossDodge(true)
+                    end
+
+                    combatTarget = tracker.Value
+                    combatPart = combatTarget
+                        and GetMonsterPart(combatTarget)
+                end
+
+                target = combatPart and combatTarget or nil
+
+                if target and pumpkinEnabled then
+                    local id = target:GetAttribute("MonsterId")
+                    local def = type(id) == "string"
+                        and monsterData[id]
+
+                    if type(def) == "table"
+                        and def.HalloweenPumpkin == true
+                        and not InCurrentActionZone(
+                            combatPart.Position
+                        ) then
+                        ClearTarget()
+                        return
+                    end
+                end
+
+                -- ให้ Dodge ทำงานก่อนเปิด Native Auto เดินต่อ
+                if target and IsDodgeMonster(target) then
+                    if StepBossDodge(
+                        bossGateId or zone.Id,
+                        target,
+                        character,
+                        humanoid,
+                        root
+                    ) then
+                        return
+                    end
+                elseif bossDodgeActive then
+                    ResetBossDodge(true)
+                end
+
+                StepNativeFarmWalk(
+                    zone, target, tracker, root
+                )
+                return
+            end
+
+            CancelNativeFarmNav()
 
             -- อยู่ในห้องหรือไม่ ไม่ขึ้นกับว่ามี Target แล้วหรือยัง
             local bossHere = bossGateId ~= nil
@@ -4614,60 +4616,6 @@ do
                 end
             end
 
-            if partyFarmEnabled and partySearching then
-                local search = partySearch
-
-                if not search then
-                    ClearTarget()
-                    SetStatus("Party Search: preparing route")
-                    return
-                end
-
-                ResetPull(true)
-                ClearTarget()
-
-                humanoid:Move(Vector3.zero, false)
-
-                if farmMovement == "Walk" then
-                    StopFarmHover()
-                else
-                    HoldFarmPosition(
-                        humanoid,
-                        root,
-                        root.Position,
-                        root.CFrame
-                    )
-                end
-
-                -- โซนที่เคยรอโหลดแล้ว ใช้เป็นทางผ่าน
-                if search.Visited[zone.Id] then
-                    search.Advance = true
-                    SetStatus("Party Search: passing " .. zone.Id)
-                    return
-                end
-
-                if not search.ArrivedAt then
-                    search.ArrivedAt = os.clock()
-                end
-
-                local elapsed = os.clock() - search.ArrivedAt
-
-                SetStatus(string.format(
-                    "Party Search: %s | loading %.1f / %.1fs",
-                    zone.Id,
-                    elapsed,
-                    PARTY_SEARCH_WAIT
-                ))
-
-                if elapsed >= PARTY_SEARCH_WAIT then
-                    search.Visited[zone.Id] = true
-                    search.Advance = true
-                    search.ArrivedAt = nil
-                end
-
-                return
-            end
-
             local function Eligible(model)
                 local id = model:GetAttribute("MonsterId")
                 if not ids[id] then return nil end
@@ -4704,79 +4652,6 @@ do
                 end
 
                 return part
-            end
-
-            if partyFarmEnabled and partyFarmLeaderRoot
-                and partyFarmLeaderRoot.Parent
-                and partyFarmData
-                and partyFarmData.Leader ~= LocalPlayer.UserId then
-
-                local offset =
-                    root.Position - partyFarmLeaderRoot.Position
-
-                local distance = Vector3.new(
-                    offset.X, 0, offset.Z
-                ).Magnitude
-
-                -- ตามเมื่อออกห่างมากพอ ไม่วาปตามทุก Tick
-                if distance > partyFarmRadius + 20 then
-                    ResetPull(true)
-                    ClearTarget()
-
-                    if isCasting then
-                        SetStatus("Party Farm: waiting for cast to finish")
-                        return
-                    end
-
-                    -- ใช้ตำแหน่งหัวหน้าที่โหลดจริง
-                    local destination = partyFarmLeaderRoot.Position
-                        + Vector3.new(0, 4, 0)
-
-                    local facing = CFrame.new(destination)
-                        * root.CFrame.Rotation
-
-                    humanoid:Move(Vector3.zero, false)
-                    root.CFrame = facing
-                    root.AssemblyLinearVelocity = Vector3.zero
-                    root.AssemblyAngularVelocity = Vector3.zero
-
-                    HoldFarmPosition(
-                        humanoid, root, destination, facing
-                    )
-
-                    SetStatus("Party Farm: following leader")
-                    return
-                end
-            end
-
-            if bossGateId or eventTarget or partyFarmEnabled or farmMovement == "Walk" then
-                -- หยุดลากมอน เพื่อโฟกัสบอสปลดด่าน
-                if pullSession then
-                    ResetPull(true)
-                    ClearTarget()
-                end
-            elseif isCasting
-                and not (
-                    pullSession
-                    and pullSession.Phase == "Fight"
-                ) then
-                -- ระหว่างร่ายหยุดลากชั่วคราว
-                -- ไม่ล้างชุดมอนที่กำลังจัดการ
-            else
-                local pullHandled, groupTarget = StepPull(
-                    Eligible,
-                    character,
-                    humanoid,
-                    root,
-                    zone
-                )
-
-                if pullHandled then return end
-
-                if groupTarget and target ~= groupTarget then
-                    ClearTarget()
-                    target = groupTarget
-                end
             end
 
             local targetPart
@@ -5025,6 +4900,12 @@ do
 
         local function Stop()
             enabled = false
+            farmWalkSpeedActive = false
+            if refreshFarmWalkSpeed then
+                refreshFarmWalkSpeed()
+            end
+
+            CancelNativeFarmNav()
             FinishFarmTravel(true)
             ResetPull(true)
 
@@ -5046,6 +4927,11 @@ do
             end
 
             enabled = true
+            farmWalkSpeedActive = true
+            if refreshFarmWalkSpeed then
+                refreshFarmWalkSpeed()
+            end
+
             worker = task.defer(function()
                 local ok, err = xpcall(function()
                     while alive and enabled do
@@ -5058,6 +4944,11 @@ do
 
                 if not ok then
                     enabled = false
+                    farmWalkSpeedActive = false
+                    if refreshFarmWalkSpeed then
+                        refreshFarmWalkSpeed()
+                    end
+
                     FinishFarmTravel(true)
                     ResetPull(true)
 
@@ -5091,41 +4982,19 @@ do
             end,
         })
 
-        section:AddDropdown("ZeroXFarmMovement", {
-            Title = "Movement Mode",
-            Description = "Teleport: วาปและลอยเข้าหามอน "
-                .. "Walk: ใช้ระบบเดินฟาร์ม "
-                .. "การเดินทางไปโซนเป้าหมายยังใช้วาป",
-            Values = { "Teleport", "Walk" },
-            Default = "Teleport",
-            Callback = function(value)
-                if not alive or (value ~= "Teleport" and value ~= "Walk") then
-                    return
-                end
-
-                ReleaseNativeWalk()
-                FinishFarmTravel(true)
-                ResetPull(true)
-                ClearTarget()
-                farmMovement = value
-            end,
-        })
-
-        section:AddSlider("ZeroXFarmHeight", {
-            Title = "Farm Height",
-            Description = "ความสูงเหนือมอนในโหมด Teleport "
-                .. "ความสูงไม่ใช้ในโหมด Walk",
-            Min = 0,
-            Max = 60,
-            Default = 30,
+        section:AddSlider("ZeroXSpeed", {
+            Title = "Speed Walk",
+            Description = "ความเร็วเดินขณะเปิดฟาร์ม "
+                .. "ปิดฟาร์มแล้วคืนความเร็วเดิม",
+            Min = 17,
+            Max = 24,
+            Default = 20,
             Increment = 1,
-            Callback = function(value)
-                if not alive or type(value) ~= "number"
-                    or value ~= value or value < 0 or value > 60 then
-                    return
-                end
 
-                FARM_HOVER_HEIGHT = value
+            Callback = function()
+                if refreshFarmWalkSpeed then
+                    refreshFarmWalkSpeed()
+                end
             end,
         })
 
@@ -5139,38 +5008,6 @@ do
                 if not alive then return end
                 selectedId = optionToId[value]
                 ClearTarget()
-            end,
-        })
-
-        pullSection:AddToggle("ZeroXPullMonsters", {
-            Title = "Pull Monsters Together",
-            Description = "เปิดใช้งานฟังชั่นรวบมอน",
-            Default = false,
-
-            Callback = function(value)
-                if not alive then return end
-                pullEnabled = value == true
-
-                if not pullEnabled then
-                    ResetPull(true)
-                    ClearTarget()
-                end
-            end,
-        })
-
-        pullSection:AddSlider("ZeroXPullCount", {
-            Title = "Monsters Per Pull",
-            Description = "จำนวนมอนต่อการลาก",
-            Min = 2,
-            Max = 6,
-            Default = 3,
-            Increment = 1,
-
-            Callback = function(value)
-                if type(value) == "number" and value == value
-                    and value >= 2 and value <= 6 then
-                    pullCount = math.floor(value)
-                end
             end,
         })
 
@@ -5239,169 +5076,6 @@ do
                 end
             end,
         })
-
-        if nativeAutoSkillRemote and nativeAutoMenu then
-            -- นโยบายตรวจสถานะของสคริปต์ ไม่ใช่ Cooldown ของเกม
-            local CHECK_INTERVAL = 1
-            local REQUEST_INTERVAL = 1
-
-            local wanted = false
-            local watchTask
-            local lastSkillRequest = -math.huge
-            local lastAutoRequest = -math.huge
-            local warnedLocked = false
-
-            local unlockModule = FindRequired(
-                shared,
-                "UnlockData",
-                "ModuleScript"
-            )
-            local unlockData = unlockModule and LoadModule(unlockModule)
-
-            local function EnsureNativeEnabled()
-                if not alive or not wanted
-                    or potionTripActive or farmPullActive
-                    or dropTripActive or sellTripActive
-                    or farmTravelActive or chestTripActive
-                    or bossDodgeActive or farmWalkActive then
-                    return
-                end
-
-                local now = os.clock()
-
-                -- ค้นใหม่เพื่อรองรับ Instance ถูกสร้างแทนตัวเดิม
-                local skillRemote = remotes
-                    and remotes:FindFirstChild("SetAutoSkill")
-
-                if skillRemote and skillRemote:IsA("RemoteEvent")
-                    and LocalPlayer:GetAttribute("AutoSkill") ~= true
-                    and now - lastSkillRequest >= REQUEST_INTERVAL then
-
-                    lastSkillRequest = now
-                    skillRemote:FireServer(true)
-                end
-
-                if LocalPlayer:GetAttribute("AutoOn") == true then
-                    warnedLocked = false
-                    return
-                end
-
-                -- ใช้เงื่อนไขปลดล็อกเดียวกับ toggleAuto ของเกม
-                if not unlockData
-                    or type(unlockData.HasLevel) ~= "function" then
-                    return
-                end
-
-                local unlocked = unlockData.HasLevel(
-                    LocalPlayer:GetAttribute("UnlockLevel"),
-                    "bot"
-                )
-
-                if not unlocked then
-                    if not warnedLocked then
-                        warnedLocked = true
-                        warn("[Zero X / Skill] Native Auto ยังไม่ปลดล็อก")
-                    end
-                    return
-                end
-
-                warnedLocked = false
-
-                local menu = LocalPlayer:FindFirstChild("LumiMenuToggle")
-
-                if menu and menu:IsA("BindableEvent")
-                    and now - lastAutoRequest >= REQUEST_INTERVAL then
-
-                    -- บันทึกก่อน Fire ป้องกัน Event เรียกซ้อน
-                    lastAutoRequest = now
-
-                    if LocalPlayer:GetAttribute("AutoOn") ~= true then
-                        menu:Fire("autoToggle")
-                    end
-                end
-            end
-
-            local function StopSkillWatch()
-                wanted = false
-
-                if watchTask then
-                    task.cancel(watchTask)
-                    watchTask = nil
-                end
-            end
-
-            local function StartSkillWatch()
-                wanted = true
-                if watchTask then return end
-
-                watchTask = task.defer(function()
-                    while alive and wanted do
-                        EnsureNativeEnabled()
-                        task.wait(CHECK_INTERVAL)
-                    end
-                    watchTask = nil
-                end)
-            end
-
-            Connect(
-                LocalPlayer:GetAttributeChangedSignal("AutoSkill"),
-                EnsureNativeEnabled
-            )
-
-            Connect(
-                LocalPlayer:GetAttributeChangedSignal("AutoOn"),
-                EnsureNativeEnabled
-            )
-
-            Connect(
-                LocalPlayer:GetAttributeChangedSignal("UnlockLevel"),
-                EnsureNativeEnabled
-            )
-
-            Connect(LocalPlayer.CharacterAdded, function()
-                if wanted then
-                    EnsureNativeEnabled()
-                end
-            end)
-
-            combatSection:AddToggle("ZeroXAutoUseSkill", {
-                Title = "Auto Use Skill",
-                Description = "เปิดระบบใช้สกิล",
-                Default = false,
-
-                Callback = function(value)
-                    if not alive or type(value) ~= "boolean" then
-                        return
-                    end
-
-                    if value then
-                        StartSkillWatch()
-                        return
-                    end
-
-                    -- หยุดตรวจให้เรียบร้อยก่อนปิดระบบเกม
-                    StopSkillWatch()
-
-                    local skillRemote =
-                        remotes:FindFirstChild("SetAutoSkill")
-
-                    if skillRemote and skillRemote:IsA("RemoteEvent")
-                        and LocalPlayer:GetAttribute("AutoSkill") ~= false then
-                        skillRemote:FireServer(false)
-                    end
-
-                    local menu =
-                        LocalPlayer:FindFirstChild("LumiMenuToggle")
-
-                    if menu and menu:IsA("BindableEvent")
-                        and LocalPlayer:GetAttribute("AutoOn") == true then
-                        menu:Fire("autoToggle")
-                    end
-                end,
-            })
-
-            MacUI:OnUnload(StopSkillWatch)
-        end
 
         do
             local respawnChoice = FindRequired(
@@ -5886,6 +5560,7 @@ do
                 end)
 
                 local function CheckPotionStock()
+
                     local inventory = ReadInventory()
                     if not inventory then
                         BuyStatus("Waiting for valid ItemsJson")
@@ -6313,42 +5988,30 @@ do
                         local old = trip
                         trip = nil
 
-                        if not old then
-                            dropTripActive = false
-                            return
-                        end
+                        if old
+                            and LocalPlayer.Character == old.Character then
+                            local humanoid = old.Character
+                                :FindFirstChildOfClass("Humanoid")
 
-                        local humanoid = old.Character
-                            :FindFirstChildOfClass("Humanoid")
-
-                        local valid = LocalPlayer.Character == old.Character
-                            and humanoid and humanoid.Health > 0
-                            and old.Root.Parent
-                            and not old.Root.Anchored
-
-                        if returnToOrigin and valid then
-                            old.Root.CFrame = old.Origin
-                            old.Root.AssemblyLinearVelocity = Vector3.zero
-                            old.Root.AssemblyAngularVelocity = Vector3.zero
+                            if humanoid and humanoid.Health > 0
+                                and old.Root.Parent then
+                                humanoid:MoveTo(old.Root.Position)
+                                humanoid:Move(Vector3.zero, false)
+                            end
                         end
 
                         dropTripActive = false
 
-                        if returnToOrigin and valid and alive
-                            and not potionTripActive and old.AutoWasOn then
-                            local menu =
-                                LocalPlayer:FindFirstChild("LumiMenuToggle")
-
-                            if menu and menu:IsA("BindableEvent")
-                                and LocalPlayer:GetAttribute("AutoOn")
-                                    ~= true then
-                                menu:Fire("autoToggle")
-                            end
-                        end
+                        -- ไม่วาปกลับ
+                        -- Auto Farm จะรับช่วงต่อในรอบถัดไป
                     end
 
                     local function DropAllowed(drop, folder)
                         if not drop:IsDescendantOf(folder) then
+                            return false
+                        end
+
+                        if not InCurrentActionZone(drop.Position) then
                             return false
                         end
 
@@ -6401,6 +6064,7 @@ do
                     end
 
                     local function CheckDrops()
+
                         if potionTripActive or sellTripActive
                             or farmPullActive or farmTravelActive
                             or chestTripActive or bossDodgeActive
@@ -6448,6 +6112,12 @@ do
                         local now = os.clock()
 
                         if trip then
+                            if not trip.Zone
+                                or trip.Zone ~= GetActionZone() then
+                                FinishDropTrip(false)
+                                return
+                            end
+
                             local drop = trip.Drop
 
                             if not DropAllowed(drop, folder) then
@@ -6456,7 +6126,7 @@ do
                                 return
                             end
 
-                            if now - trip.StartedAt >= 5 then
+                            if now - trip.StartedAt >= 45 then
                                 retryAt[drop] = now + RETRY_DELAY
                                 FinishDropTrip(true)
                                 return
@@ -6466,20 +6136,26 @@ do
                                 return
                             end
 
-                            humanoid:Move(Vector3.zero, false)
+                            local distance =
+                                (drop.Position - root.Position).Magnitude
 
-                            if not trip.Moved then
-                                local destination = drop.Position
-                                    + Vector3.new(0, math.min(2, reach / 2), 0)
+                            if distance > math.max(0.5, reach - 1) then
+                                if now - (trip.LastMoveAt or -math.huge)
+                                    >= 1 then
+                                    trip.LastMoveAt = now
 
-                                root.CFrame = CFrame.new(destination)
-                                    * root.CFrame.Rotation
-                                root.AssemblyLinearVelocity = Vector3.zero
-                                root.AssemblyAngularVelocity = Vector3.zero
+                                    humanoid:MoveTo(Vector3.new(
+                                        drop.Position.X,
+                                        root.Position.Y,
+                                        drop.Position.Z
+                                    ))
+                                end
 
-                                trip.Moved = true
-                                return -- ตรวจระยะใหม่ในรอบหน้า
+                                return
                             end
+
+                            humanoid:MoveTo(root.Position)
+                            humanoid:Move(Vector3.zero, false)
 
                             if not trip.SentAt then
                                 if now - lastRequest < 0.6 then return end
@@ -6555,6 +6231,7 @@ do
 
                         trip = {
                             Character = character,
+                            Zone = GetActionZone(),
                             Root = root,
                             Origin = root.CFrame,
                             Drop = nearest,
@@ -6563,9 +6240,15 @@ do
                         }
 
                         dropTripActive = true
-                        ClearTarget()
 
-                        if autoOn then
+                        CancelNativeFarmNav()
+                        FinishFarmTravel(false)
+                        ResetPull(false)
+                        ClearTarget()
+                        StopFarmHover()
+
+                        if autoOn
+                            and LocalPlayer:GetAttribute("AutoOn") == true then
                             menu:Fire("autoToggle")
                         end
                     end
@@ -6906,15 +6589,22 @@ do
                         return
                     end
 
-                    local humanoid = old.Character
-                        :FindFirstChildOfClass("Humanoid")
+                    StopFarmHover()
 
-                    local valid = LocalPlayer.Character == old.Character
-                        and humanoid and humanoid.Health > 0
+                    local sameCharacter =
+                        LocalPlayer.Character == old.Character
+                    local humanoid = sameCharacter
+                        and old.Character:FindFirstChildOfClass("Humanoid")
+
+                    local valid = humanoid
+                        and humanoid.Health > 0
                         and old.Root.Parent
                         and not old.Root.Anchored
 
-                    if returnToOrigin and valid then
+                    if returnToOrigin and valid and old.Moved then
+                        humanoid:MoveTo(old.Root.Position)
+                        humanoid:Move(Vector3.zero, false)
+
                         old.Root.CFrame = old.Origin
                         old.Root.AssemblyLinearVelocity = Vector3.zero
                         old.Root.AssemblyAngularVelocity = Vector3.zero
@@ -6925,7 +6615,9 @@ do
                     if returnToOrigin and valid and alive
                         and old.AutoWasOn
                         and not potionTripActive
-                        and not dropTripActive then
+                        and not dropTripActive
+                        and not chestTripActive
+                        and not farmTravelActive then
 
                         local menu =
                             LocalPlayer:FindFirstChild("LumiMenuToggle")
@@ -6950,11 +6642,6 @@ do
                         return false
                     end
 
-                    if root.Anchored then
-                        SellStatus("Waiting: character anchored")
-                        return false
-                    end
-
                     if sellTrip and (
                         sellTrip.Character ~= character
                         or sellTrip.Root ~= root
@@ -6963,92 +6650,134 @@ do
                         return false
                     end
 
-
-                    local map = workspace:FindFirstChild("Map")
-                    local npcs = map and map:FindFirstChild("NPCs")
-                    local merchant = npcs
-                        and npcs:FindFirstChild("merchant")
-
-                    if not merchant or not merchant:IsA("Model") then
-                        SellStatus("Waiting for Map.NPCs.merchant")
-                        return false
-                    end
-
                     if not sellTrip then
-                        local autoOn =
-                            LocalPlayer:GetAttribute("AutoOn") == true
-                        local menu =
-                            LocalPlayer:FindFirstChild("LumiMenuToggle")
-
-                        if autoOn and not (
-                            menu and menu:IsA("BindableEvent")
-                        ) then
-                            SellStatus("Cannot pause native Auto")
-                            return false
-                        end
-
                         sellTrip = {
                             Character = character,
                             Root = root,
                             Origin = root.CFrame,
-                            AutoWasOn = autoOn,
+                            AutoWasOn =
+                                LocalPlayer:GetAttribute("AutoOn") == true,
                             StartedAt = os.clock(),
+                            Moved = false,
                         }
 
+                        humanoid:MoveTo(root.Position)
+                        humanoid:Move(Vector3.zero, false)
+
                         sellTripActive = true
+
+                        -- หยุดเส้นทางฟาร์มก่อนเริ่มกลับเมือง
+                        CancelNativeFarmNav()
+                        FinishFarmTravel(false)
                         ResetPull(false)
                         ClearTarget()
+                        StopFarmHover()
+                    end
 
-                        if autoOn then
-                            menu:Fire("autoToggle")
-                        end
+                    local trip = sellTrip
+                    local now = os.clock()
 
-                        SellStatus("Pausing farm before selling")
+                    -- เวลานี้เป็นนโยบายของสคริปต์
+                    if now - trip.StartedAt >= 20 then
+                        blocked = true
+                        FinishSellTrip(true)
+                        SellStatus(
+                            "Paused: Merchant trip timed out"
+                        )
                         return false
                     end
 
-                    if os.clock() - sellTrip.StartedAt >= 8 then
-                        FinishSellTrip(true)
-                        lastAttempt = os.clock()
-                        SellStatus("Merchant trip timed out")
+                    if root.Anchored then
+                        SellStatus("Waiting: character anchored")
                         return false
                     end
 
                     if LocalPlayer:GetAttribute("AutoOn") == true then
+                        local menu =
+                            LocalPlayer:FindFirstChild("LumiMenuToggle")
+
+                        if not menu or not menu:IsA("BindableEvent") then
+                            SellStatus("Waiting for native Auto control")
+                            return false
+                        end
+
+                        if now - (trip.LastAutoRequest or -math.huge)
+                            >= 1 then
+                            trip.LastAutoRequest = now
+                            menu:Fire("autoToggle")
+                        end
+
+                        SellStatus("Waiting for native Auto to stop")
                         return false
                     end
 
-                    humanoid:Move(Vector3.zero, false)
+
+                    -- ค้นจาก NpcId ไม่ผูกกับตัวพิมพ์ของชื่อ Model
+                    local merchant = trip.Merchant
+
+                    if not merchant
+                        or not merchant:IsDescendantOf(workspace) then
+                        merchant = nil
+
+                        local map = workspace:FindFirstChild("Map")
+                        local npcs = map and map:FindFirstChild("NPCs")
+
+                        if npcs then
+                            for _, npc in ipairs(npcs:GetChildren()) do
+                                if npc:IsA("Model")
+                                    and npc:GetAttribute("NpcId")
+                                        == "merchant" then
+                                    merchant = npc
+                                    break
+                                end
+                            end
+                        end
+
+                        trip.Merchant = merchant
+                    end
+
+                    if not merchant then
+                        SellStatus("In town: waiting for Merchant")
+                        return false
+                    end
 
                     local pivot = merchant:GetPivot()
                     local distance =
                         (root.Position - pivot.Position).Magnitude
 
-                    if not sellTrip.Moved
+                    local destination =
+                        (pivot * CFrame.new(0, 0, 4)).Position
+                    local facing =
+                        CFrame.lookAt(destination, pivot.Position)
+
+                    if not trip.Moved
                         or distance > SELL_MERCHANT_DISTANCE then
-                        -- หากถูกดึงออกจาก NPC ต้องเริ่มรอใหม่
-                        sellTrip.ArrivedAt = nil
+                        trip.ArrivedAt = nil
 
-                        local position =
-                            (pivot * CFrame.new(0, 0, 4)).Position
+                        humanoid:MoveTo(root.Position)
+                        humanoid:Move(Vector3.zero, false)
 
-                        root.CFrame = CFrame.lookAt(
-                            position, pivot.Position
-                        )
+                        root.CFrame = facing
                         root.AssemblyLinearVelocity = Vector3.zero
                         root.AssemblyAngularVelocity = Vector3.zero
 
-                        sellTrip.Moved = true
+                        trip.Moved = true
+
+                        HoldFarmPosition(
+                            humanoid, root, destination, facing
+                        )
+
                         SellStatus("Moved to Merchant; checking arrival")
                         return false
                     end
 
-                    -- เริ่มนับหลังรอบถัดมายืนยันว่าอยู่ใกล้ NPC จริง
-                    local now = os.clock()
-                    sellTrip.ArrivedAt = sellTrip.ArrivedAt or now
+                    HoldFarmPosition(
+                        humanoid, root, destination, facing
+                    )
 
+                    trip.ArrivedAt = trip.ArrivedAt or now
                     local remaining = SELL_ARRIVAL_DELAY
-                        - (now - sellTrip.ArrivedAt)
+                        - (now - trip.ArrivedAt)
 
                     if remaining > 0 then
                         SellStatus(string.format(
@@ -7639,6 +7368,10 @@ do
                         return nil
                     end
 
+                    if not InCurrentActionZone(part.Position) then
+                        return nil
+                    end
+
                     local owner = box:GetAttribute("OwnerUserId")
                     local freeAt = box:GetAttribute("FreeAt") or 0
 
@@ -7697,11 +7430,9 @@ do
                         and old.Root.Parent
                         and not old.Root.Anchored
 
-                    if returnToOrigin and valid then
+                    if valid then
+                        humanoid:MoveTo(old.Root.Position)
                         humanoid:Move(Vector3.zero, false)
-                        old.Root.CFrame = old.Origin
-                        old.Root.AssemblyLinearVelocity = Vector3.zero
-                        old.Root.AssemblyAngularVelocity = Vector3.zero
                     end
 
                     chestTripActive = false
@@ -7724,6 +7455,7 @@ do
                 end
 
                 local function CheckChests()
+
                     if potionTripActive or sellTripActive
                         or dropTripActive or farmTravelActive
                         or bossDodgeActive
@@ -7771,6 +7503,13 @@ do
 
                     if chestTrip then
                         local trip = chestTrip
+
+                        if not trip.Zone
+                            or trip.Zone ~= GetActionZone() then
+                            FinishChestTrip(false)
+                            return
+                        end
+
                         local part = ChestPart(trip.Box)
 
                         if not part then
@@ -7779,7 +7518,7 @@ do
                             return
                         end
 
-                        if now - trip.StartedAt >= 6
+                        if now - trip.StartedAt >= 45
                             or (trip.SentAt
                                 and now - trip.SentAt >= RESULT_TIMEOUT) then
                             retryAt[trip.Box] = now + RETRY_DELAY
@@ -7798,29 +7537,45 @@ do
                             return
                         end
 
-                        local destination = part.Position
-                            + Vector3.new(0, 2, 0)
-                        local facing = CFrame.new(destination)
-                            * root.CFrame.Rotation
+                        local openPrompt =
+                            part:FindFirstChild("OpenPrompt")
 
-                        humanoid:Move(Vector3.zero, false)
+                        local walkReach = 6
 
-                        if not trip.Moved then
-                            root.CFrame = facing
-                            root.AssemblyLinearVelocity = Vector3.zero
-                            root.AssemblyAngularVelocity = Vector3.zero
-
-                            HoldFarmPosition(
-                                humanoid, root, destination, facing
+                        if openPrompt
+                            and openPrompt:IsA("ProximityPrompt") then
+                            walkReach = math.max(
+                                0.5,
+                                math.min(
+                                    walkReach,
+                                    openPrompt.MaxActivationDistance - 1
+                                )
                             )
+                        end
 
-                            trip.Moved = true
+                        local distance =
+                            (part.Position - root.Position).Magnitude
+
+                        if distance > walkReach then
+                            if now - (trip.LastMoveAt or -math.huge)
+                                >= 1 then
+                                trip.LastMoveAt = now
+
+                                humanoid:MoveTo(Vector3.new(
+                                    part.Position.X,
+                                    root.Position.Y,
+                                    part.Position.Z
+                                ))
+                            end
+
+                            chestInputStatus:SetValue(
+                                "กำลังเดินไปเปิดกล่อง"
+                            )
                             return
                         end
 
-                        HoldFarmPosition(
-                            humanoid, root, destination, facing
-                        )
+                        humanoid:MoveTo(root.Position)
+                        humanoid:Move(Vector3.zero, false)
 
                         if not trip.SentAt and now - lastSend >= 0.5 then
                             local prompt = part:FindFirstChild("OpenPrompt")
@@ -7968,6 +7723,7 @@ do
                     chestTrip = {
                         Box = nearest,
                         Character = character,
+                        Zone = GetActionZone(),
                         Root = root,
                         Origin = root.CFrame,
                         AutoWasOn = autoOn,
@@ -7976,10 +7732,15 @@ do
                     }
 
                     chestTripActive = true
+
+                    CancelNativeFarmNav()
+                    FinishFarmTravel(false)
                     ResetPull(false)
                     ClearTarget()
+                    StopFarmHover()
 
-                    if nativeRunning then
+                    if nativeRunning
+                        and LocalPlayer:GetAttribute("AutoOn") == true then
                         menu:Fire("autoToggle")
                     end
 
@@ -8005,7 +7766,8 @@ do
 
                 chestSection:AddToggle("ZeroXAutoOpenChest", {
                     Title = "Auto Open Chest",
-                    Description = "วาปเปิดกล่อง LootBox ออโต้ แล้วกลับจุดเดิม",
+                    Description = "พักฟาร์มแล้วเดินไปกด E เปิดกล่อง "
+                        .. "เสร็จแล้วฟาร์มต่อโดยไม่วาปกลับ",
                     Default = false,
 
                     Callback = function(value)
@@ -8075,8 +7837,6 @@ do
     local GuiService = game:GetService("GuiService")
 
     local state = {
-        WalkSpeed = false,
-        Speed = 32,
         InfiniteJump = false,
         Noclip = false,
         InstantPrompt = false,
@@ -8291,10 +8051,12 @@ do
     -- Movement: มี Connection เดียวเฉพาะตอนมีฟังก์ชันที่ต้องอัปเดต
     --------------------------------------------------------------------------
     local function UpdateMotion()
-        local needed = state.WalkSpeed or state.Noclip
+        local needed = farmWalkSpeedActive or state.Noclip
             or state.Fly or state.DisableAnimations
 
-        if not state.WalkSpeed then Restore(speedSaved) end
+        if not farmWalkSpeedActive then
+            Restore(speedSaved)
+        end
         if not state.Noclip then Restore(collisionSaved) end
         if not state.Fly then StopFlight() end
         if not state.DisableAnimations then ClearAnimations() end
@@ -8323,8 +8085,15 @@ do
                 return
             end
 
-            if state.WalkSpeed then
-                Patch(speedSaved, humanoid, "WalkSpeed", state.Speed)
+            if farmWalkSpeedActive then
+                local option = Options.ZeroXSpeed
+                local speed = option and option.Value
+
+                if type(speed) == "number"
+                    and speed == speed
+                    and speed >= 1 and speed <= 200 then
+                    Patch(speedSaved, humanoid, "WalkSpeed", speed)
+                end
             end
 
             if state.Noclip and character then
@@ -8592,19 +8361,13 @@ do
         })
     end
 
-    AddStateToggle(Movement, "ZeroXWalkSpeed", "WalkSpeed",
-        "WalkSpeed", UpdateMotion)
+    refreshFarmWalkSpeed = function()
+        if alive then
+            UpdateMotion()
+        end
+    end
 
-    Movement:AddSlider("ZeroXSpeed", {
-        Title = "Speed",
-        Min = 0,
-        Max = 200,
-        Default = 32,
-        Increment = 1,
-        Callback = function(value)
-            state.Speed = value
-        end,
-    })
+    refreshFarmWalkSpeed()
 
     AddStateToggle(Movement, "ZeroXInfiniteJump", "Infinite Jump",
         "InfiniteJump")
@@ -9125,6 +8888,47 @@ do
     end
 
     InitAutoQuest()
+end
+do
+    local active = true
+    local player = game:GetService("Players").LocalPlayer
+
+    local lastTag
+
+    local function UpdateFlag()
+        if not active then return end
+
+        local tag = player:GetAttribute("CheatTag")
+
+        if tag == lastTag then return end
+        lastTag = tag
+
+        if tag == nil or tag == "" then
+            flagLabel:SetValue(
+                "ไม่พบ CheatTag — ไม่ยืนยันสถานะการตรวจจับ"
+            )
+        elseif type(tag) == "string" then
+            flagLabel:SetValue("พบแท็กจากเกม: " .. tag)
+        else
+            flagLabel:SetValue(
+                "CheatTag มีชนิดข้อมูลที่ยังไม่รองรับ"
+            )
+        end
+    end
+
+    local connection =
+        player:GetAttributeChangedSignal("CheatTag"):Connect(
+            UpdateFlag
+        )
+
+    -- แสดงสถานะตั้งแต่เริ่ม แม้ค่าเริ่มต้นเป็น nil
+    lastTag = {}
+    UpdateFlag()
+
+    MacUI:OnUnload(function()
+        active = false
+        connection:Disconnect()
+    end)
 end
 
 -- Keep the original settings folders and custom theme loading.
