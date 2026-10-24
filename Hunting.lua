@@ -1764,6 +1764,7 @@ do
 
         local walkUnlockModule = shared:FindFirstChild("UnlockData")
         local walkUnlockData
+        local lastWalkUnlockRead = -math.huge
 
         if walkUnlockModule
             and walkUnlockModule:IsA("ModuleScript") then
@@ -1943,6 +1944,28 @@ do
             end
 
             if LocalPlayer:GetAttribute("AutoOn") ~= true then
+                -- รองรับ UnlockData ที่มาหลังเริ่มสคริปต์
+                if (
+                    not walkUnlockData
+                    or type(walkUnlockData.HasLevel) ~= "function"
+                ) and os.clock() - lastWalkUnlockRead >= 3 then
+
+                    lastWalkUnlockRead = os.clock()
+
+                    local module = shared
+                        and shared:FindFirstChild("UnlockData")
+
+                    if module and module:IsA("ModuleScript") then
+                        walkUnlockModule = module
+                        walkUnlockData = LoadModule(module)
+                    end
+
+                    -- require อาจรอระหว่างที่ผู้ใช้ปิดฟาร์ม
+                    if not alive or not enabled then
+                        return
+                    end
+                end
+
                 if not walkUnlockData
                     or type(walkUnlockData.HasLevel) ~= "function" then
                     walkInfo:SetValue("Waiting for native unlock data")
