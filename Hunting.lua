@@ -8889,47 +8889,6 @@ do
 
     InitAutoQuest()
 end
-do
-    local active = true
-    local player = game:GetService("Players").LocalPlayer
-
-    local lastTag
-
-    local function UpdateFlag()
-        if not active then return end
-
-        local tag = player:GetAttribute("CheatTag")
-
-        if tag == lastTag then return end
-        lastTag = tag
-
-        if tag == nil or tag == "" then
-            flagLabel:SetValue(
-                "ไม่พบ CheatTag — ไม่ยืนยันสถานะการตรวจจับ"
-            )
-        elseif type(tag) == "string" then
-            flagLabel:SetValue("พบแท็กจากเกม: " .. tag)
-        else
-            flagLabel:SetValue(
-                "CheatTag มีชนิดข้อมูลที่ยังไม่รองรับ"
-            )
-        end
-    end
-
-    local connection =
-        player:GetAttributeChangedSignal("CheatTag"):Connect(
-            UpdateFlag
-        )
-
-    -- แสดงสถานะตั้งแต่เริ่ม แม้ค่าเริ่มต้นเป็น nil
-    lastTag = {}
-    UpdateFlag()
-
-    MacUI:OnUnload(function()
-        active = false
-        connection:Disconnect()
-    end)
-end
 
 -- Keep the original settings folders and custom theme loading.
 ThemeManager:SetLibrary(MacUI)
