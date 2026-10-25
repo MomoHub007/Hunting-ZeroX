@@ -7,6 +7,17 @@ if not game:IsLoaded() then
     until game:IsLoaded()
 end
 
+local GuiService = game:GetService("GuiService")
+
+local ok, err = pcall(function()
+    GuiService:SetGameplayPausedNotificationEnabled(false)
+end)
+
+if not ok then
+    warn("[Zero X / Streaming] Cannot hide pause notification: "
+        .. tostring(err))
+end
+
 local BASE = (getgenv and getgenv().MacUIBase) or "https://raw.githubusercontent.com/Kiwzu/Mac-OS-UI-LUA/refs/heads/main/"
 
 local MacUI = loadstring(game:HttpGet(BASE .. "MacUIFramework.lua"))()
@@ -3254,6 +3265,75 @@ do
             local destination = position
                 + Vector3.new(0, WAIT_HEIGHT, 0)
 
+            if workspace.StreamingEnabled
+                and travel.StreamHop ~= hop then
+
+                local now = os.clock()
+                if now < (travel.NextStreamAt or 0) then
+                    return false
+                end
+
+                if travel.StreamTarget ~= hop then
+                    travel.StreamTarget = hop
+                    travel.StreamTries = 0
+                end
+
+                travel.StreamTries += 1
+                SetStatus("Loading destination: " .. hop.Id)
+
+                local loaded, streamError = pcall(function()
+                    LocalPlayer:RequestStreamAroundAsync(destination, 5)
+                end)
+
+                -- คำขอโหลดมีการ yield ต้องตรวจสถานะใหม่
+                if not alive or not enabled
+                    or farmTravel ~= travel
+                    or LocalPlayer.Character ~= character
+                    or not root.Parent
+                    or humanoid.Health <= 0 then
+                    return false
+                end
+
+                if root.Anchored then
+                    return false
+                end
+
+                local map = workspace:FindFirstChild("Map")
+                local fields = map and map:FindFirstChild("BlockFields")
+                local field = fields and fields:FindFirstChild(hop.Id)
+                local island = field and field:FindFirstChild("Island")
+                local floor
+
+                if island then
+                    for _, name in ipairs({ "Base", "Dirt" }) do
+                        local part = island:FindFirstChild(name)
+                        if part and part:IsA("BasePart")
+                            and part.CanCollide then
+                            floor = part
+                            break
+                        end
+                    end
+                end
+
+                if not loaded or not floor then
+                    travel.NextStreamAt = os.clock() + 2
+
+                    if travel.StreamTries >= 3 then
+                        travel.Blocked =
+                            "destination streaming not ready"
+                    end
+
+                    SetStatus(
+                        loaded and "Waiting for destination floor"
+                            or "Streaming error: " .. tostring(streamError)
+                    )
+                    return false
+                end
+
+                travel.StreamHop = hop
+                return false
+            end
+
             StopFarmHover()
             root.CFrame = CFrame.new(destination) * root.CFrame.Rotation
             root.AssemblyLinearVelocity = Vector3.zero
@@ -5244,7 +5324,7 @@ do
             if items and shopBuy then
                 -- ค่านโยบายของสคริปต์
                 local CHECK_INTERVAL = 0.2
-                local CONFIRM_TIMEOUT = 8
+                local CONFIRM_TIMEOUT = 15
 
                 local buyEnabled = false
                 local buyWorker
@@ -5572,9 +5652,62 @@ do
                         return false
                     end
 
-                    -- เวลารอตรวจตำแหน่งของสคริปต์
-                    -- ไม่ใช่การยืนยันตำแหน่งจาก Server
-                    if os.clock() - trip.MovedAt < 0.6 then
+                    -- ต้องอยู่ใกล้ Merchant ต่อเนื่องก่อนเปิดร้าน
+                    -- เวลารอเป็นนโยบายของสคริปต์ ไม่ใช่ ACK จาก Server
+                    local now = os.clock()
+
+                    if distance > 12 then
+                        trip.ShopNearSince = nil
+                        trip.ShopOpenedAt = nil
+                        return false
+                    end
+
+                    if LocalPlayer.GameplayPaused then
+                        trip.ShopNearSince = nil
+                        BuyStatus("Waiting for destination streaming")
+                        return false
+                    end
+
+                    trip.ShopNearSince = trip.ShopNearSince or now
+
+                    if now - trip.ShopNearSince < 1.5 then
+                        BuyStatus("At Merchant: waiting for stable arrival")
+                        return false
+                    end
+
+                    -- เปิดร้านครั้งเดียวต่อทริป
+                    if not trip.ShopOpenedAt then
+                        local openNpc = remotes:FindFirstChild("OpenNpc")
+
+                        if not openNpc or not openNpc:IsA("RemoteEvent") then
+                            BuyStatus("OpenNpc unavailable")
+
+                            if now - trip.StartedAt >= 20 then
+                                paused = true
+                                FinishPotionTrip(true)
+                                BuyStatus("Stopped: OpenNpc unavailable")
+                            end
+
+                            return false
+                        end
+
+                        local sent, err = pcall(function()
+                            openNpc:FireServer("merchant")
+                        end)
+
+                        if not sent then
+                            paused = true
+                            FinishPotionTrip(true)
+                            BuyStatus("Cannot open Merchant: " .. tostring(err))
+                            return false
+                        end
+
+                        trip.ShopOpenedAt = now
+                        BuyStatus("Merchant interaction requested; waiting before purchase")
+                        return false
+                    end
+
+                    if now - trip.ShopOpenedAt < 1 then
                         return false
                     end
 
