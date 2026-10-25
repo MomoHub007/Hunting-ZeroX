@@ -1,5 +1,3 @@
-local print = function() end
-local warn = function() end
 
 if not game:IsLoaded() then
     repeat
@@ -1766,8 +1764,19 @@ do
             end
         end
 
+        local lastWalkMessage
+
         local walkInfo = {
-            SetValue = function() end,
+            SetValue = function(_, message)
+                message = tostring(message)
+
+                if message == lastWalkMessage then
+                    return
+                end
+
+                lastWalkMessage = message
+                print("[Zero X / Farm / Native] " .. message)
+            end,
         }
 
         local nativeWalkOwned = false
@@ -1820,10 +1829,36 @@ do
                 return HttpService:JSONDecode(raw)
             end)
 
-            if not ok or type(settings) ~= "table"
-                or type(settings.FixedArea) ~= "boolean" then
-                -- ห้ามส่งค่าเริ่มต้นทับการตั้งค่าเดิมเมื่ออ่านข้อมูลไม่ได้
-                walkInfo:SetValue("Waiting for valid BotJson")
+            if not ok then
+                walkInfo:SetValue(
+                    "BotJson decode failed: " .. tostring(settings)
+                )
+                return false
+            end
+
+            if type(settings) ~= "table" then
+                walkInfo:SetValue(
+                    "BotJson must decode to table; got "
+                        .. type(settings)
+                )
+                return false
+            end
+
+            -- ป้องกันส่งค่าบางส่วนทับการตั้งค่าทั้งชุด
+            if next(settings) == nil then
+                walkInfo:SetValue("BotJson is empty; waiting for game settings")
+                return false
+            end
+
+            -- Native default: ไม่ระบุ FixedArea = Roam and fight
+            -- แก้เฉพาะตารางที่ Decode แล้ว เก็บฟิลด์อื่นทั้งหมดไว้
+            if settings.FixedArea == nil then
+                settings.FixedArea = false
+            elseif type(settings.FixedArea) ~= "boolean" then
+                walkInfo:SetValue(
+                    "Invalid FixedArea type: "
+                        .. type(settings.FixedArea)
+                )
                 return false
             end
 
@@ -4729,6 +4764,11 @@ do
                 StepNativeFarmWalk(
                     zone, target, tracker, root
                 )
+
+                SelectNearestFarmTarget(
+                    zone, ids, tracker, root
+                )
+
                 return
             end
 
@@ -4925,11 +4965,6 @@ do
                 StepNativeFarmWalk(
                     zone, target, tracker, root
                 )
-
-                SelectNearestFarmTarget(
-                    zone, ids, tracker, root
-                )
-
                 return
             end
 
@@ -6679,7 +6714,7 @@ do
             end
         end
 
-        do
+        (function()
             local junkRemote = FindRequired(
                 remotes, "ShopSellJunk", "RemoteEvent"
             )
@@ -7463,7 +7498,7 @@ do
                     StopSellWorker()
                 end)
             end
-        end
+        end)()
 
         do
             local chestSection = Tabs.Event:AddSection({
