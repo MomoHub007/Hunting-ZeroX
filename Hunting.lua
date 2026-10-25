@@ -1,3 +1,6 @@
+local print = function() end
+local warn = function() end
+
 
 if not game:IsLoaded() then
     repeat
