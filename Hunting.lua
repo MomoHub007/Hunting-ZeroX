@@ -3682,53 +3682,39 @@ do
             Connect(bossFx.OnClientEvent, function(
                 action, bossName, skillName, zonesData, duration
             )
-                -- รับเป้าที่ Native Auto เพิ่งเลือก
-                -- ไม่เปลี่ยนผู้ร่ายระหว่างกำลังหลบ
-                if alive and enabled and dodgeEnabled
-                    and farmMovement == "Walk"
-                    and not bossDodgeActive then
-
-                    local tracker = GetTracker()
-                    local nativeTarget = tracker and tracker.Value
-
-                    target = nativeTarget
-                        and GetMonsterPart(nativeTarget)
-                        and nativeTarget
-                        or nil
-                end
-
                 if not alive or not enabled or not dodgeEnabled
-                    or not target or not GetMonsterPart(target)
                     or potionTripActive or sellTripActive
                     or dropTripActive or chestTripActive
-                    or farmTravelActive then
+                    or farmTravelActive
+                    or type(bossName) ~= "string"
+                    or type(skillName) ~= "string" then
                     return
                 end
 
-                if not IsDodgeMonster(target) then return end
+                -- หาโมเดลบอสจากชื่อโดยตรง ไม่ผูกกับ Target ที่ล็อกอยู่
+                -- เพื่อให้จับสัญญาณสกิลได้แม้ไม่ได้ Target บอสตัวนั้น
+                local bossModel
+                local matching = 0
 
-                local id = target:GetAttribute("MonsterId")
-                local def = monsterData[id]
-                local name = target:GetAttribute("DisplayName")
-                    or (type(def) == "table" and def.Name)
+                for model in pairs(monsters) do
+                    if IsDodgeMonster(model) and GetMonsterPart(model) then
+                        local modelId = model:GetAttribute("MonsterId")
+                        local modelDef = monsterData[modelId]
+                        local modelName = model:GetAttribute("DisplayName")
+                            or (type(modelDef) == "table" and modelDef.Name)
 
-                if bossName ~= name or type(skillName) ~= "string" then
-                    return
+                        if modelName == bossName then
+                            matching += 1
+                            bossModel = model
+                        end
+                    end
                 end
 
                 -- Remote มีแค่ชื่อ จึงไม่ใช้เมื่อมีผู้ร่ายชื่อเดียวกันหลายตัว
-                local matching = 0
-                for model in pairs(monsters) do
-                    local modelId = model:GetAttribute("MonsterId")
-                    local modelDef = monsterData[modelId]
-                    local modelName = model:GetAttribute("DisplayName")
-                        or (type(modelDef) == "table" and modelDef.Name)
+                if matching ~= 1 or not bossModel then return end
 
-                    if modelName == bossName and GetMonsterPart(model) then
-                        matching += 1
-                    end
-                end
-                if matching ~= 1 then return end
+                local id = bossModel:GetAttribute("MonsterId")
+                local def = monsterData[id]
 
                 local key = bossName .. "|" .. skillName
                 local now = os.clock()
@@ -3736,7 +3722,8 @@ do
                 if action == "cancel" then
                     for index = #dodgeEvents, 1, -1 do
                         local event = dodgeEvents[index]
-                        if event.Key == key and not event.Hit then
+                        if event.Boss == bossModel
+                            and event.Key == key and not event.Hit then
                             table.remove(dodgeEvents, index)
                         end
                     end
@@ -3747,7 +3734,8 @@ do
                     if not NumberOK(duration) or duration < 0 then return end
 
                     for _, event in ipairs(dodgeEvents) do
-                        if event.Key == key and not event.Hit then
+                        if event.Boss == bossModel
+                            and event.Key == key and not event.Hit then
                             event.Hit = true
                             event.Expires = math.max(
                                 event.Expires,
@@ -3836,7 +3824,7 @@ do
                 if #snapshot == 0 then return end
 
                 table.insert(dodgeEvents, {
-                    Boss = target,
+                    Boss = bossModel,
                     Key = key,
                     Zones = snapshot,
                     Inner = skill.Shape == "donut" and skill.Inner or nil,
@@ -3851,18 +3839,21 @@ do
         local function StepBossDodge(
             gate, model, character, humanoid, root
         )
-            if not dodgeEnabled or not gate
-                or not IsDodgeMonster(model) then
+            if not dodgeEnabled or not gate then
                 if bossDodgeActive then ResetBossDodge(true) end
                 return false
             end
 
             local now = os.clock()
+
+            -- ล้าง Event ที่หมดอายุ หรือผู้ร่ายตายไปแล้วออกก่อนเสมอ
+            -- ไม่ผูกกับ Target ที่ล็อกอยู่ตอนนี้ เพราะอาจไม่มี Target เลย
             for index = #dodgeEvents, 1, -1 do
                 local event = dodgeEvents[index]
 
-                if event.Boss ~= model
-                    or now >= event.Expires then
+                if now >= event.Expires
+                    or not event.Boss
+                    or not GetMonsterPart(event.Boss) then
                     table.remove(dodgeEvents, index)
                 end
             end
@@ -3872,6 +3863,17 @@ do
                     ResetBossDodge(true)
                     dodgeStatus:SetValue("พ้นช่วงหลบ กลับไปโจมตี")
                 end
+                return false
+            end
+
+            -- ไม่มี Target ล็อกอยู่ก็หลบได้ โดยยึดผู้ร่ายจาก Event
+            -- ที่ยังทำงานอยู่แทน (เข้าวงสกิลแล้วต้องหลบทันที)
+            if not model or not IsDodgeMonster(model) then
+                model = dodgeEvents[1].Boss
+            end
+
+            if not model or not IsDodgeMonster(model) then
+                if bossDodgeActive then ResetBossDodge(true) end
                 return false
             end
 
@@ -4378,6 +4380,86 @@ do
             end
         end
 
+        local lastNearestTargetRequest = -math.huge
+
+        local function SelectNearestFarmTarget(zone, ids, tracker, root)
+            if not alive or not enabled
+                or bossDodgeActive
+                or potionTripActive or sellTripActive
+                or dropTripActive or chestTripActive
+                or farmTravelActive
+                or LocalPlayer:GetAttribute("AutoOn") ~= true
+                or os.clock() < skillCastUntil then
+                return
+            end
+
+            if not tracker or not tracker:IsA("ObjectValue")
+                or not tracker.Parent
+                or not root or not root.Parent
+                or type(ids) ~= "table"
+                or not setTarget.Parent then
+                return
+            end
+
+            local zoneFolder = workspace:FindFirstChild("Zones")
+            local zonePart = zoneFolder
+                and zoneFolder:FindFirstChild(zone.Id)
+
+            if not zonePart or not zonePart:IsA("BasePart") then
+                return
+            end
+
+            local nearest
+            local nearestDistance = math.huge
+
+            -- ใช้ Cache เดิม ซึ่งรองรับมอนเกิดใหม่และถูกลบ
+            for candidate in pairs(monsters) do
+                if not candidate:IsA("Model")
+                    or candidate:GetAttribute("IsDummy") == true then
+                    continue
+                end
+
+                local id = candidate:GetAttribute("MonsterId")
+                if ids[id] ~= true then
+                    continue
+                end
+
+                local part = GetMonsterPart(candidate)
+                if not part
+                    or not InsideActionZone(zonePart, part.Position) then
+                    continue
+                end
+
+                local distance = (part.Position - root.Position).Magnitude
+
+                -- ระยะเท่ากันให้ใช้ตัวเดิม ป้องกันสลับโดยไม่จำเป็น
+                if distance < nearestDistance
+                    or (distance == nearestDistance
+                        and candidate == tracker.Value) then
+                    nearest = candidate
+                    nearestDistance = distance
+                end
+            end
+
+            if not nearest or tracker.Value == nearest then
+                return
+            end
+
+            -- จำกัดการเปลี่ยน Target ไม่ยิงทุกเฟรม
+            local now = os.clock()
+            if now - lastNearestTargetRequest < 0.4 then
+                return
+            end
+            lastNearestTargetRequest = now
+
+            tracker.Value = nearest
+            target = nearest
+            holding = false
+
+            -- เลือกเป้า แล้วให้ Native Auto เดินและโจมตีตามปกติ
+            setTarget:FireServer(nearest, false)
+        end
+
         local function Step()
             if chestTripActive then
                 SetStatus("Opening chest: farming paused")
@@ -4633,18 +4715,15 @@ do
                 end
 
                 -- ให้ Dodge ทำงานก่อนเปิด Native Auto เดินต่อ
-                if target and IsDodgeMonster(target) then
-                    if StepBossDodge(
-                        bossGateId or zone.Id,
-                        target,
-                        character,
-                        humanoid,
-                        root
-                    ) then
-                        return
-                    end
-                elseif bossDodgeActive then
-                    ResetBossDodge(true)
+                -- ทำงานแม้ไม่ได้ Target บอสอยู่ ถ้ายืนอยู่ในวงสกิลจริง
+                if StepBossDodge(
+                    bossGateId or zone.Id,
+                    target,
+                    character,
+                    humanoid,
+                    root
+                ) then
+                    return
                 end
 
                 StepNativeFarmWalk(
@@ -4695,17 +4774,15 @@ do
                     end
                 end
 
-                if target and GetMonsterPart(target) then
-                    if StepBossDodge(
-                        bossGateId,
-                        target,
-                        character,
-                        humanoid,
-                        root
-                    ) then
-                        return
-                    end
-                else
+                if StepBossDodge(
+                    bossGateId,
+                    target,
+                    character,
+                    humanoid,
+                    root
+                ) then
+                    return
+                elseif not (target and GetMonsterPart(target)) then
                     dodgeStatus:SetValue(
                         "อยู่ในห้องแล้ว รอ Model บอสโหลดหรือเกิด"
                     )
@@ -4848,6 +4925,11 @@ do
                 StepNativeFarmWalk(
                     zone, target, tracker, root
                 )
+
+                SelectNearestFarmTarget(
+                    zone, ids, tracker, root
+                )
+
                 return
             end
 
