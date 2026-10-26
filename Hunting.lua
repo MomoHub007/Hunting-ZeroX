@@ -4555,7 +4555,8 @@ do
         end
 
         JobAutomation.IsBusy = function()
-            return potionTripActive
+            return JobAutomation.TrickTrip
+                or potionTripActive
                 or sellTripActive
                 or dropTripActive
                 or chestTripActive
@@ -4565,6 +4566,10 @@ do
         end
 
         local function Step()
+            if JobAutomation.TrickTrip then
+                return
+            end
+
             -- ใช้ช่องในตารางเดิม ไม่เพิ่ม Local ค้างในฟังก์ชันใหญ่
             if os.clock() >= (JobAutomation.FarmDebugAt or 0) then
                 JobAutomation.FarmDebugAt = os.clock() + 5
@@ -4682,6 +4687,49 @@ do
                 ClearTarget()
                 SetStatus(reason)
                 return
+            end
+
+            local planKey = table.concat({
+                tostring(level),
+                tostring(mode),
+                tostring(zone.Id),
+                tostring(bossGateId),
+                tostring(partyFarmEnabled),
+                tostring(pumpkinEnabled),
+            }, "|")
+
+            if JobAutomation.LastLevelPlanDebug ~= planKey then
+                JobAutomation.LastLevelPlanDebug = planKey
+
+                print(string.format(
+                    "[Zero X / Farm / Level Plan]"
+                        .. " Level=%s Mode=%s Chosen=%s"
+                        .. " MinLevel=%s Order=%s BossGate=%s"
+                        .. " Party=%s Halloween=%s",
+                    tostring(level),
+                    tostring(mode),
+                    tostring(zone.Id),
+                    tostring(zone.MinLevel),
+                    tostring(zone.Order),
+                    tostring(bossGateId),
+                    tostring(partyFarmEnabled),
+                    tostring(pumpkinEnabled)
+                ))
+
+                for _, candidate in ipairs(zones) do
+                    if candidate.Data.BossRoom ~= true then
+                        print(string.format(
+                            "[Zero X / Farm / Zone]"
+                                .. " Id=%s LevelText=%s"
+                                .. " MinLevel=%s Order=%s Accessible=%s",
+                            tostring(candidate.Id),
+                            tostring(candidate.Data.LevelText),
+                            tostring(candidate.MinLevel),
+                            tostring(candidate.Order),
+                            tostring(CanAccess(candidate, level))
+                        ))
+                    end
+                end
             end
 
             nativeFarmIds = {}
@@ -5294,6 +5342,560 @@ do
                 end
             end)
         end
+
+        (function()
+            local active = true
+            local gachaEnabled = false
+            local treatEnabled = false
+            local pullCount = 10
+            local stopAllSkins = true
+            local gachaFailed = false
+            local treatPending
+            local lastKnock = -math.huge
+            local lastMessages = {}
+
+            local skins = {
+                "hw_sword", "hw_knife", "hw_bow", "hw_rod",
+                "hw_book", "hw_axe", "hw_katana", "hw_flask",
+            }
+
+            local gachaSection = Tabs.Event:AddSection({
+                Title = "Halloween Gacha",
+                Icon = "gift",
+            })
+
+            local treatSection = Tabs.Event:AddSection({
+                Title = "Trick or Treat",
+                Icon = "candy",
+            })
+
+            local function Report(kind, message)
+                if lastMessages[kind] == message then return end
+                lastMessages[kind] = message
+                print("[Zero X / " .. kind .. "] " .. message)
+            end
+
+            local function Finite(value)
+                return type(value) == "number"
+                    and value == value
+                    and value >= 0 and value < math.huge
+            end
+
+            local function LoadShared(name)
+                local object = shared:FindFirstChild(name)
+                if not object or not object:IsA("ModuleScript") then
+                    return nil
+                end
+
+                local ok, result = pcall(require, object)
+
+                if not ok or type(result) ~= "table" then
+                    warn("[Zero X / Halloween] Cannot load "
+                        .. name .. ": " .. tostring(result))
+                    return nil
+                end
+
+                return result
+            end
+
+            local gachaData = LoadShared("GachaData")
+            local treatData = LoadShared("TrickTreatData")
+
+            local function CharacterReady()
+                local character = LocalPlayer.Character
+                local humanoid = character
+                    and character:FindFirstChildOfClass("Humanoid")
+                local root = humanoid and humanoid.RootPart
+
+                if humanoid and humanoid.Health > 0
+                    and root and root:IsA("BasePart") and root.Parent
+                    and not root.Anchored
+                    and not LocalPlayer.GameplayPaused then
+                    return root
+                end
+
+                return nil
+            end
+
+            local function BagFull()
+                local used = LocalPlayer:GetAttribute("BagSlotsUsed")
+                local maximum = LocalPlayer:GetAttribute("BagSlotsMax")
+
+                -- ข้อมูลยังไม่พร้อม = รอก่อนใช้เงิน
+                if not Finite(used) or not Finite(maximum)
+                    or maximum <= 0 then
+                    return true
+                end
+
+                return used >= maximum
+            end
+
+            local function OtherTrip()
+                return potionTripActive or sellTripActive
+                    or dropTripActive or chestTripActive
+                    or farmTravelActive or bossDodgeActive
+                    or JobAutomation.Switching
+                    or os.clock() < skillCastUntil
+            end
+
+            local function AllSkinsOwned()
+                local raw = LocalPlayer:GetAttribute("SkinsOwned")
+                if type(raw) ~= "string" then return false end
+
+                local owned = {}
+                for id in raw:gmatch("[^,]+") do
+                    owned[id:match("^%s*(.-)%s*$")] = true
+                end
+
+                for _, id in ipairs(skins) do
+                    if not owned[id] then return false end
+                end
+
+                return true
+            end
+
+            local function ReadCandy()
+                if not treatData
+                    or type(treatData.Currency) ~= "string" then
+                    return nil
+                end
+
+                local raw = LocalPlayer:GetAttribute("ItemsJson")
+                if type(raw) ~= "string" then return nil end
+
+                local ok, inventory = pcall(function()
+                    return HttpService:JSONDecode(raw)
+                end)
+
+                if not ok or type(inventory) ~= "table" then
+                    return nil
+                end
+
+                local amount = inventory[treatData.Currency]
+                if amount == nil then amount = 0 end
+
+                return Finite(amount) and amount or nil
+            end
+
+            local function StepGacha()
+                if not gachaEnabled or gachaFailed then return end
+                if not CharacterReady() or OtherTrip() then return end
+
+                if not gachaData or gachaData.Enabled ~= true
+                    or not Finite(gachaData.EventEndsAt) then
+                    Report("Gacha", "Event configuration unavailable / disabled")
+                    return
+                end
+
+                if workspace:GetServerTimeNow() >= gachaData.EventEndsAt then
+                    Report("Gacha", "Halloween Gacha event ended")
+                    return
+                end
+
+                if BagFull() then
+                    Report("Gacha", "Waiting for bag space / capacity data")
+                    return
+                end
+
+                local count = pullCount
+                local tokens = LocalPlayer:GetAttribute("GachaTokens")
+                local cost1 = gachaData.Cost1
+                local cost10 = gachaData.Cost10
+
+                if not Finite(tokens)
+                    or not Finite(cost1) or cost1 <= 0
+                    or not Finite(cost10) or cost10 <= 0 then
+                    Report("Gacha", "Waiting for valid prices / GachaTokens")
+                    return
+                end
+
+                -- ใช้เงินที่เหลือต่อด้วย x1
+                if count == 10 and tokens < cost10 then
+                    count = 1
+                end
+
+                local cost = count == 10 and cost10 or cost1
+
+                if tokens < cost then
+                    gachaEnabled = false
+
+                    local toggle = Options.ZeroXAutoHalloweenGacha
+                    if toggle and toggle.Value == true then
+                        toggle:SetValue(false)
+                    end
+
+                    Report("Gacha", "Stopped: not enough Pumpkin Heads")
+                    return
+                end
+
+                local remote = remotes:FindFirstChild("GachaPull")
+                if not remote or not remote:IsA("RemoteFunction") then
+                    Report("Gacha", "GachaPull RemoteFunction unavailable")
+                    return
+                end
+
+                Report("Gacha", "Requesting pull x" .. count)
+
+                -- Worker นี้รอ InvokeServer จบก่อน จึงไม่มีคำขอซ้อนกัน
+                local ok, result = pcall(function()
+                    return remote:InvokeServer(count)
+                end)
+
+                if not active then return end
+
+                if not ok or type(result) ~= "table"
+                    or type(result.Ok) ~= "boolean" then
+                    gachaFailed = true
+                    warn("[Zero X / Gacha] Unconfirmed result: "
+                        .. tostring(result))
+                    Report("Gacha", "Paused; check log before toggling off/on")
+                    return
+                end
+
+                if not result.Ok then
+                    gachaFailed = true
+                    Report("Gacha", "Server rejected: " .. tostring(result.Msg))
+                    return
+                end
+
+                local results = result.Results
+                Report("Gacha", "Server confirmed pull x" .. count)
+
+                if type(results) == "table" then
+                    for _, reward in ipairs(results) do
+                        if type(reward) == "table" then
+                            print(string.format(
+                                "[Zero X / Gacha / Reward] Id=%s Item=%s"
+                                    .. " Amount=%s SkinId=%s",
+                                tostring(reward.Id),
+                                tostring(reward.Item),
+                                tostring(reward.Amount),
+                                tostring(reward.SkinId)
+                            ))
+                        end
+                    end
+                end
+            end
+
+            local treatTrip
+            local nextTreatTripAt = 0
+
+            local function FinishTreatTrip()
+                local trip = treatTrip
+                treatTrip = nil
+
+                if trip then
+                    local sameCharacter =
+                        LocalPlayer.Character == trip.Character
+                    local humanoid = sameCharacter
+                        and trip.Character:FindFirstChildOfClass("Humanoid")
+                    local root = trip.Root
+
+                    if humanoid and humanoid.Health > 0
+                        and root.Parent and not root.Anchored then
+                        humanoid:Move(Vector3.zero, false)
+
+                        if trip.Moved then
+                            root.CFrame = trip.Origin
+                            root.AssemblyLinearVelocity = Vector3.zero
+                            root.AssemblyAngularVelocity = Vector3.zero
+                        end
+
+                        if trip.AutoWasOn and active and alive
+                            and LocalPlayer:GetAttribute("AutoOn") ~= true then
+                            local menu = LocalPlayer:FindFirstChild("LumiMenuToggle")
+                            if menu and menu:IsA("BindableEvent") then
+                                menu:Fire("autoToggle")
+                            end
+                        end
+                    end
+                end
+
+                JobAutomation.TrickTrip = false
+                nextTreatTripAt = os.clock() + 4
+            end
+
+            local function StopTreat(message)
+                treatEnabled = false
+                treatPending = nil
+                FinishTreatTrip()
+
+                local toggle = Options.ZeroXAutoTrickTreat
+                if toggle and toggle.Value == true then
+                    toggle:SetValue(false)
+                end
+
+                Report("Trick or Treat", message)
+            end
+
+            local function StepTreat()
+                if not treatEnabled then
+                    if treatTrip then FinishTreatTrip() end
+                    return
+                end
+
+                local now = os.clock()
+
+                if treatTrip then
+                    local trip = treatTrip
+                    local root = CharacterReady()
+
+                    if not root or root ~= trip.Root
+                        or LocalPlayer.Character ~= trip.Character then
+                        StopTreat("Character unavailable; trip stopped")
+                        return
+                    end
+
+                    if now - trip.StartedAt >= 15 then
+                        StopTreat("Trip timed out; returned without retrying")
+                        return
+                    end
+
+                    if treatPending then
+                        local candy = ReadCandy()
+
+                        if candy and candy < treatPending.Before then
+                            treatPending = nil
+                            FinishTreatTrip()
+                            Report("Trick or Treat",
+                                "Candy decrease observed; returned to farming")
+                        elseif now - treatPending.At >= 8 then
+                            StopTreat("No spending observation; returned and stopped")
+                        end
+
+                        return
+                    end
+
+                    if LocalPlayer:GetAttribute("AutoOn") == true then
+                        local menu = LocalPlayer:FindFirstChild("LumiMenuToggle")
+
+                        if menu and menu:IsA("BindableEvent")
+                            and now - (trip.LastAutoAt or -math.huge) >= 1 then
+                            trip.LastAutoAt = now
+                            menu:Fire("autoToggle")
+                        end
+
+                        Report("Trick or Treat", "Waiting for native Auto to stop")
+                        return
+                    end
+
+                    local prompt = trip.Prompt
+                    local spot = trip.Spot
+
+                    if not prompt:IsDescendantOf(workspace)
+                        or not spot:IsDescendantOf(workspace)
+                        or prompt.Parent ~= spot then
+                        StopTreat("House streamed out / removed")
+                        return
+                    end
+
+                    local humanoid =
+                        trip.Character:FindFirstChildOfClass("Humanoid")
+                    humanoid:Move(Vector3.zero, false)
+
+                    if not trip.Moved then
+                        -- จุด KnockSpot ตรวจพบจริงจาก Runtime
+                        root.CFrame = CFrame.new(
+                            spot.Position + Vector3.new(0, 2, 0)
+                        ) * root.CFrame.Rotation
+
+                        root.AssemblyLinearVelocity = Vector3.zero
+                        root.AssemblyAngularVelocity = Vector3.zero
+                        trip.Moved = true
+                        trip.MovedAt = now
+
+                        Report("Trick or Treat", "Moved to Witch House")
+                        return
+                    end
+
+                    local reach = math.min(13, prompt.MaxActivationDistance)
+
+                    if (root.Position - spot.Position).Magnitude > reach then
+                        StopTreat("Arrival not maintained; returned")
+                        return
+                    end
+
+                    if now - trip.MovedAt < 1 then return end
+                    if not prompt.Enabled then
+                        Report("Trick or Treat", "Waiting for KnockPrompt")
+                        return
+                    end
+
+                    local candy = ReadCandy()
+
+                    if not candy or candy < treatData.Cost or BagFull() then
+                        FinishTreatTrip()
+                        Report("Trick or Treat", "Candy / capacity changed; returned")
+                        return
+                    end
+
+                    lastKnock = now
+                    treatPending = { Before = candy, At = now }
+
+                    local ok, err = pcall(function()
+                        fireproximityprompt(prompt)
+                    end)
+
+                    if not ok then
+                        StopTreat("Prompt failed: " .. tostring(err))
+                        return
+                    end
+
+                    Report("Trick or Treat", "Knock requested; waiting for Candy update")
+                    return
+                end
+
+                if now < nextTreatTripAt or OtherTrip() then return end
+
+                local root = CharacterReady()
+                if not root or BagFull() then return end
+
+                if not treatData or not Finite(treatData.Cost)
+                    or treatData.Cost <= 0
+                    or not Finite(treatData.Cooldown) then
+                    Report("Trick or Treat", "Invalid TrickTreatData")
+                    return
+                end
+
+                if now - lastKnock < math.max(4, treatData.Cooldown) then
+                    return
+                end
+
+                local candy = ReadCandy()
+                if not candy or candy < treatData.Cost then
+                    Report("Trick or Treat", "Waiting for enough Halloween Candy")
+                    return
+                end
+
+                if type(fireproximityprompt) ~= "function" then
+                    Report("Trick or Treat", "fireproximityprompt unavailable")
+                    return
+                end
+
+                local nearestPrompt
+                local nearestSpot
+                local distance = math.huge
+
+                for _, house in ipairs(CollectionService:GetTagged("TrickHouse")) do
+                    if house:IsDescendantOf(workspace) then
+                        local spot = house:FindFirstChild("KnockSpot")
+                        local prompt = spot and spot:FindFirstChild("KnockPrompt")
+
+                        if spot and spot:IsA("BasePart")
+                            and prompt and prompt:IsA("ProximityPrompt")
+                            and prompt.Enabled then
+                            local current = (root.Position - spot.Position).Magnitude
+
+                            if current < distance then
+                                distance = current
+                                nearestPrompt = prompt
+                                nearestSpot = spot
+                            end
+                        end
+                    end
+                end
+
+                if not nearestPrompt then
+                    Report("Trick or Treat", "Waiting for a loaded Witch House")
+                    return
+                end
+
+                local autoWasOn = LocalPlayer:GetAttribute("AutoOn") == true
+                local menu = LocalPlayer:FindFirstChild("LumiMenuToggle")
+
+                if autoWasOn and not (menu and menu:IsA("BindableEvent")) then
+                    Report("Trick or Treat", "Cannot pause native Auto")
+                    return
+                end
+
+                treatTrip = {
+                    Character = LocalPlayer.Character,
+                    Root = root,
+                    Origin = root.CFrame,
+                    AutoWasOn = autoWasOn,
+                    Prompt = nearestPrompt,
+                    Spot = nearestSpot,
+                    StartedAt = now,
+                }
+
+                JobAutomation.TrickTrip = true
+
+                CancelNativeFarmNav()
+                ClearTarget()
+                StopFarmHover()
+
+                if autoWasOn then menu:Fire("autoToggle") end
+
+                Report("Trick or Treat", "Starting nearest-house trip")
+            end
+
+            gachaSection:AddDropdown("ZeroXHalloweenPullCount", {
+                Title = "Pull Amount",
+                Description = "เลือกจำนวนสุ่มต่อรอบ",
+                Values = { "x1", "x10" },
+                Default = "x10",
+
+                Callback = function(value)
+                    pullCount = value == "x1" and 1 or 10
+                end,
+            })
+
+            gachaSection:AddToggle("ZeroXAutoHalloweenGacha", {
+                Title = "Auto Pull Halloween Gacha",
+                Description = "ใช้ Pumpkin Head สุ่มตามจำนวนที่เลือก ",
+                Default = false,
+
+                Callback = function(value)
+                    gachaEnabled = value == true
+                    if gachaEnabled then gachaFailed = false end
+                end,
+            })
+
+            treatSection:AddToggle("ZeroXAutoTrickTreat", {
+                Title = "Auto Trick or Treat",
+                Description = "วาร์ปเคาะบ้านใกล้ที่สุด"
+                    .. "แล้วกลับจุดเดิม ใช้ Halloween Candy",
+                Default = false,
+
+                Callback = function(value)
+                    treatEnabled = value == true
+
+                    if not treatEnabled then
+                        FinishTreatTrip()
+                    end
+                end,
+            })
+
+            local function RunWorker(step)
+                return task.defer(function()
+                    while active and alive do
+                        local ok, err = xpcall(step, debug.traceback)
+
+                        if not ok then
+                            if step == StepTreat then
+                                StopTreat("Worker error; trip stopped")
+                            end
+                            warn("[Zero X / Halloween] " .. tostring(err))
+                            return
+                        end
+
+                        task.wait(0.5)
+                    end
+                end)
+            end
+
+            local gachaWorker = RunWorker(StepGacha)
+            local treatWorker = RunWorker(StepTreat)
+
+            MacUI:OnUnload(function()
+                FinishTreatTrip()
+                active = false
+                gachaEnabled = false
+                treatEnabled = false
+                task.cancel(gachaWorker)
+                task.cancel(treatWorker)
+            end)
+        end)()
 
         local choices = {}
         for id, data in pairs(catalog) do
@@ -5957,6 +6559,9 @@ do
                 local nextPotionDebug = 0
 
                 local function CheckPotionStock()
+                    if JobAutomation.TrickTrip then
+                        return
+                    end
 
                     local inventory = ReadInventory()
                     if not inventory then
@@ -6509,6 +7114,9 @@ do
                     end
 
                     local function CheckDrops()
+                        if JobAutomation.TrickTrip then
+                            return
+                        end
 
                         if potionTripActive or sellTripActive
                             or farmPullActive or farmTravelActive
@@ -7447,6 +8055,10 @@ do
                 end
 
                 local function SellStep()
+                    if JobAutomation.TrickTrip then
+                        return
+                    end
+
                     SellDebugSnapshot()
 
                     if pendingSale then
@@ -8001,6 +8613,9 @@ do
                 end
 
                 local function CheckChests()
+                    if JobAutomation.TrickTrip then
+                        return
+                    end
 
                     if potionTripActive or sellTripActive
                         or dropTripActive or farmTravelActive
