@@ -1,7 +1,6 @@
 local print = function() end
 local warn = function() end
 
-
 if not game:IsLoaded() then
     repeat
         game.Loaded:Wait()
@@ -668,10 +667,19 @@ do
 	end
 end
 
+local JobAutomation = {
+    Switching = false,
+}
+
 local Tabs = {
     AutoFarm = Window:AddTab({
         Title = "Auto Farm",
         Icon = "swords",
+        Section = "Main",
+    }),
+    Job = Window:AddTab({
+        Title = "Job",
+        Icon = "briefcase",
         Section = "Main",
     }),
     Shop = Window:AddTab({
@@ -3439,11 +3447,13 @@ do
             return nil
         end
 
-        ResetBossDodge = function(restoreAuto)
+        ResetBossDodge = function(restoreAuto, keepEvents)
             local old = dodgeSession
             dodgeSession = nil
             bossDodgeActive = false
-            table.clear(dodgeEvents)
+            if not keepEvents then
+                table.clear(dodgeEvents)
+            end
 
             if not old then return end
 
@@ -3874,6 +3884,42 @@ do
             end)
         end
 
+        local function CurrentDangerAt(position)
+            for _, event in ipairs(dodgeEvents) do
+                local inSafe = false
+
+                for _, zone in ipairs(event.Zones) do
+                    if zone.Safe == true
+                        and InsideAttack(zone, position, 0) == true then
+                        inSafe = true
+                        break
+                    end
+                end
+
+                for _, zone in ipairs(event.Zones) do
+                    if zone.Safe ~= true then
+                        -- ตรวจเริ่มหลบด้วยขอบจริง ไม่บวกระยะเผื่อ
+                        local inside = InsideAttack(
+                            zone, position, 0, event.Inner
+                        )
+
+                        if inside == true then
+                            local room = zone.Room == true
+                                or zone.Kind == "room"
+
+                            -- วงเขียวป้องกันเฉพาะการโจมตีทั้งห้อง
+                            if not room or not inSafe then
+                                return event
+                            end
+                        end
+                    end
+                end
+            end
+
+            -- รูปทรงที่อ่านไม่ได้จะไม่ถือว่าอยู่ในวงโดยเดาเอง
+            return nil
+        end
+
         local function StepBossDodge(
             gate, model, character, humanoid, root
         )
@@ -3904,11 +3950,21 @@ do
                 return false
             end
 
-            -- ไม่มี Target ล็อกอยู่ก็หลบได้ โดยยึดผู้ร่ายจาก Event
-            -- ที่ยังทำงานอยู่แทน (เข้าวงสกิลแล้วต้องหลบทันที)
-            if not model or not IsDodgeMonster(model) then
-                model = dodgeEvents[1].Boss
+            local danger = CurrentDangerAt(root.Position)
+
+            if not danger then
+                if bossDodgeActive then
+                    -- คืนการฟาร์ม แต่เก็บ Event ไว้
+                    -- ถ้าเดินกลับเข้าวงก่อนสกิลหมด ยังตรวจพบได้
+                    ResetBossDodge(true, true)
+                end
+
+                dodgeStatus:SetValue("อยู่นอกพื้นที่อันตราย — ฟาร์มต่อ")
+                return false
             end
+
+            -- ใช้ผู้ร่ายของวงที่ตัวละครกำลังยืนอยู่จริง
+            model = danger.Boss
 
             if not model or not IsDodgeMonster(model) then
                 if bossDodgeActive then ResetBossDodge(true) end
@@ -4498,7 +4554,58 @@ do
             setTarget:FireServer(nearest, false)
         end
 
+        JobAutomation.IsBusy = function()
+            return potionTripActive
+                or sellTripActive
+                or dropTripActive
+                or chestTripActive
+                or farmTravelActive
+                or bossDodgeActive
+                or os.clock() < skillCastUntil
+        end
+
         local function Step()
+            -- ใช้ช่องในตารางเดิม ไม่เพิ่ม Local ค้างในฟังก์ชันใหญ่
+            if os.clock() >= (JobAutomation.FarmDebugAt or 0) then
+                JobAutomation.FarmDebugAt = os.clock() + 5
+
+                print(string.format(
+                    "[Zero X / Farm / Gate]"
+                        .. " Enabled=%s Requested=%s Mode=%s"
+                        .. " JobSwitch=%s Potion=%s Sell=%s"
+                        .. " Drop=%s Chest=%s Travel=%s Dodge=%s"
+                        .. " AutoOn=%s LastStatus=%s",
+                    tostring(enabled),
+                    tostring(farmRequested),
+                    tostring(mode),
+                    tostring(JobAutomation.Switching),
+                    tostring(potionTripActive),
+                    tostring(sellTripActive),
+                    tostring(dropTripActive),
+                    tostring(chestTripActive),
+                    tostring(farmTravelActive),
+                    tostring(bossDodgeActive),
+                    tostring(LocalPlayer:GetAttribute("AutoOn")),
+                    tostring(statusText)
+                ))
+
+                if farmTravel then
+                    print(string.format(
+                        "[Zero X / Farm / Travel Debug]"
+                            .. " Goal=%s Blocked=%s Attempts=%s StreamTries=%s",
+                        tostring(farmTravel.Goal and farmTravel.Goal.Id),
+                        tostring(farmTravel.Blocked),
+                        tostring(farmTravel.Attempts),
+                        tostring(farmTravel.StreamTries)
+                    ))
+                end
+            end
+
+            if JobAutomation.Switching then
+                SetStatus("Paused: Auto Job is changing class")
+                return
+            end
+
             if chestTripActive then
                 SetStatus("Opening chest: farming paused")
                 return
@@ -5247,6 +5354,13 @@ do
 
                 farmRequested = value == true
 
+                print(string.format(
+                    "[Zero X / Farm / Toggle] Requested=%s WorkerEnabled=%s Alive=%s",
+                    tostring(farmRequested),
+                    tostring(enabled),
+                    tostring(alive)
+                ))
+
                 if farmRequested or pumpkinEnabled
                     or partyFarmEnabled then
                     Start()
@@ -5839,12 +5953,43 @@ do
                     FinishPotionTrip(false)
                 end)
 
+                local potionRetryAt
+                local nextPotionDebug = 0
+
                 local function CheckPotionStock()
 
                     local inventory = ReadInventory()
                     if not inventory then
                         BuyStatus("Waiting for valid ItemsJson")
                         return
+                    end
+
+                    local now = os.clock()
+
+                    if now >= nextPotionDebug then
+                        nextPotionDebug = now + 5
+
+                        for _, category in ipairs({ "Red", "Blue" }) do
+                            local selectedId = selectedPotions[category]
+                            local stock = selectedId
+                                and ReadCount(inventory, selectedId)
+
+                            print(string.format(
+                                "[Zero X / Potion / Debug]"
+                                    .. " Category=%s Item=%s Stock=%s"
+                                    .. " Trigger=%s Goal=%s Restocking=%s"
+                                    .. " Paused=%s Pending=%s Trip=%s",
+                                category,
+                                tostring(selectedId),
+                                tostring(stock),
+                                tostring(restockAt),
+                                tostring(desiredStock),
+                                tostring(selectedId and restocking[selectedId] == true),
+                                tostring(paused),
+                                tostring(pendingPurchase and pendingPurchase.Id),
+                                tostring(potionTripActive)
+                            ))
+                        end
                     end
 
                     -- ตรวจผลคำขอเดิมก่อนอนุญาตให้ซื้อเพิ่ม
@@ -5906,7 +6051,27 @@ do
                         end
                     end
 
-                    if paused then return end
+                    -- มาถึงตรงนี้ได้เมื่อไม่มีคำขอ ShopBuy ค้างเท่านั้น
+                    -- จึงลองเตรียมทริปใหม่ได้โดยไม่ส่งซื้อซ้ำกับคำขอเดิม
+                    if paused then
+                        local now = os.clock()
+
+                        if not potionRetryAt then
+                            potionRetryAt = now + 30
+                            BuyStatus("Preparation paused: retrying in 30 seconds")
+                            return
+                        end
+
+                        if now < potionRetryAt then
+                            return
+                        end
+
+                        paused = false
+                        potionRetryAt = nil
+                        BuyStatus("Retrying potion stock / Merchant preparation")
+                    else
+                        potionRetryAt = nil
+                    end
 
                     if sellTripActive then
                         BuyStatus("Waiting for selling to finish")
@@ -6776,6 +6941,69 @@ do
                     print("[Zero X / Sell] " .. message)
                 end
 
+                local sellDebugAt = -math.huge
+
+                local function SellDebugSnapshot()
+                    local now = os.clock()
+                    if now - sellDebugAt < 5 then return end
+                    sellDebugAt = now
+
+                    print(string.format(
+                        "[Zero X / Sell / Debug]"
+                            .. " Junk=%s Bulk=%s OnlyFull=%s"
+                            .. " Slots=%s/%s Weight=%s/%s"
+                            .. " Blocked=%s Pending=%s"
+                            .. " Trip=%s AutoOn=%s",
+                        tostring(junkEnabled),
+                        tostring(bulkEnabled),
+                        tostring(onlyFull),
+                        tostring(LocalPlayer:GetAttribute("BagSlotsUsed")),
+                        tostring(LocalPlayer:GetAttribute("BagSlotsMax")),
+                        tostring(LocalPlayer:GetAttribute("Weight")),
+                        tostring(LocalPlayer:GetAttribute("MaxWeight")),
+                        tostring(blocked),
+                        tostring(pendingSale ~= nil),
+                        tostring(sellTripActive),
+                        tostring(LocalPlayer:GetAttribute("AutoOn"))
+                    ))
+
+                    for _, attribute in ipairs({
+                        "GearJson", "EquipJson", "LocksJson", "RefineJson",
+                    }) do
+                        local raw = LocalPlayer:GetAttribute(attribute)
+                        local valid = false
+                        local entries = 0
+
+                        if type(raw) == "string" and raw ~= "" then
+                            local ok, decoded = pcall(function()
+                                return HttpService:JSONDecode(raw)
+                            end)
+
+                            if ok and type(decoded) == "table" then
+                                valid = true
+                                for _ in pairs(decoded) do
+                                    entries += 1
+                                end
+                            end
+                        end
+
+                        print(string.format(
+                            "[Zero X / Sell / Data] %s Type=%s Valid=%s Entries=%d",
+                            attribute, typeof(raw), tostring(valid), entries
+                        ))
+                    end
+
+                    local grades = {}
+                    for grade = 0, 4 do
+                        if selectedGrades[grade] == true then
+                            table.insert(grades, "Tier " .. tostring(grade + 1))
+                        end
+                    end
+
+                    print("[Zero X / Sell / Grades] "
+                        .. (#grades > 0 and table.concat(grades, ", ") or "NONE"))
+                end
+
                 -- ข้อมูลป้องกันไอเทมอ่านไม่ได้ = ไม่ขาย
                 local function ReadSellJson(attribute)
                     local raw = LocalPlayer:GetAttribute(attribute)
@@ -7219,20 +7447,50 @@ do
                 end
 
                 local function SellStep()
+                    SellDebugSnapshot()
+
                     if pendingSale then
                         CheckSaleResult()
-                        if pendingSale then return end
+
+                        if pendingSale then
+                            SellStatus("Gate: waiting for previous sale result")
+                            return
+                        end
                     end
 
-                    if blocked or potionTripActive
-                        or dropTripActive or farmTravelActive
-                        or chestTripActive or bossDodgeActive then
+                    if blocked then
+                        SellStatus("Gate: blocked after previous failure; "
+                            .. "check earlier log before toggling off/on")
                         return
                     end
-                    if os.clock() - lastAttempt < interval then return end
 
-                    if onlyFull and not BagIsFull() then
-                        SellStatus("Waiting for full bag")
+                    if potionTripActive then
+                        SellStatus("Gate: Potion trip active")
+                        return
+                    elseif dropTripActive then
+                        SellStatus("Gate: Drop trip active")
+                        return
+                    elseif farmTravelActive then
+                        SellStatus("Gate: Farm travel active")
+                        return
+                    elseif chestTripActive then
+                        SellStatus("Gate: Chest trip active")
+                        return
+                    elseif bossDodgeActive then
+                        SellStatus("Gate: Boss dodge active")
+                        return
+                    end
+
+                    if onlyFull then
+                        if not BagIsFull() then
+                            SellStatus("Gate: waiting for full bag")
+                            return
+                        end
+
+                        -- กระเป๋าเต็ม: ข้าม Sell Interval ไปเริ่มทริปขาย
+                        SellStatus("Bag full: starting sale without interval delay")
+                    elseif os.clock() - lastAttempt < interval then
+                        SellStatus("Gate: waiting for Sell Interval")
                         return
                     end
 
@@ -7275,6 +7533,14 @@ do
                     end
 
                     if not mode then
+                        SellStatus(
+                            "Gate: no sell candidates"
+                                .. " | Junk=" .. tostring(junkEnabled)
+                                .. " Bulk=" .. tostring(bulkEnabled)
+                                .. " | Check selected grades, valid JSON,"
+                                .. " equipped, locked, bound, refine and Sell price"
+                        )
+
                         FinishSellTrip(true)
                         return
                     end
@@ -9530,6 +9796,605 @@ do
         end
     end)
 end
+
+(function()
+    local RS = game:GetService("ReplicatedStorage")
+    local HttpService = game:GetService("HttpService")
+    local sharedFolder = RS:WaitForChild("Shared", 5)
+    local remotes = RS:WaitForChild("Remotes", 5)
+    local module = sharedFolder
+        and sharedFolder:WaitForChild("JobData", 5)
+
+    local section = Tabs.Job:AddSection({
+        Title = "Job Progression",
+        Icon = "briefcase",
+    })
+
+    section:AddParagraph({
+        Title = "Auto Job",
+        Content = "ฝึกอาชีพที่จำเป็นตามเงื่อนไขของคลาสที่เลือก "
+            .. "ใช้ Farm Level อัตโนมัติ",
+    })
+
+    local status = section:AddLabel({
+        Title = "Job Progress",
+        Value = "รอเลือกอาชีพ",
+    })
+
+    if not module or not module:IsA("ModuleScript")
+        or not remotes then
+        status:SetValue("ไม่พบ Shared.JobData หรือ Remotes")
+        return
+    end
+
+    local loaded, data = pcall(require, module)
+
+    if not loaded or type(data) ~= "table"
+        or type(data.Jobs) ~= "table"
+        or type(data.Order) ~= "table" then
+        status:SetValue("อ่าน JobData ไม่สำเร็จ")
+        warn("[Zero X / Job] Invalid JobData: " .. tostring(data))
+        return
+    end
+
+    local alive = true
+    local enabled = false
+    local selected
+    local pending
+    local saved
+    local lastReport
+    local choices = {}
+    local labelToId = {}
+    local added = {}
+
+    local function Report(message)
+        status:SetValue(message)
+
+        if message ~= lastReport then
+            lastReport = message
+            print("[Zero X / Job] " .. message)
+        end
+    end
+
+    local function NumberOK(value)
+        return type(value) == "number"
+            and value == value
+            and value >= 0 and value < math.huge
+    end
+
+    local function AddJob(id)
+        if type(id) ~= "string" or added[id]
+            or type(data.Jobs[id]) ~= "table" then
+            return
+        end
+
+        -- เก็บทุกอาชีพไว้ตรวจ prerequisite
+        added[id] = true
+
+        -- แสดงเฉพาะสองอาชีพเป้าหมายใน Dropdown
+        if id ~= "Alchemist" and id ~= "Samurai" then
+            return
+        end
+
+        local name = data.Jobs[id].Name
+        local label = (type(name) == "string" and name or id)
+            .. " [" .. id .. "]"
+
+        labelToId[label] = id
+        table.insert(choices, label)
+    end
+
+    for _, id in ipairs(data.Order) do
+        AddJob(id)
+    end
+
+    if type(data.SpecialOrder) == "table" then
+        for _, id in ipairs(data.SpecialOrder) do
+            AddJob(id)
+        end
+    end
+
+    local function SetOption(id, value)
+        local option = Options[id]
+
+        if option and option.Value ~= value then
+            option:SetValue(value)
+        end
+    end
+
+    local jobTrip
+
+    local function ReadSpecialJobs()
+        local raw = LocalPlayer:GetAttribute("SpecialJobsJson")
+
+        if type(raw) ~= "string" or raw == "" then
+            return nil
+        end
+
+        local ok, result = pcall(function()
+            return HttpService:JSONDecode(raw)
+        end)
+
+        return ok and type(result) == "table" and result or nil
+    end
+
+    local function FinishJobTrip()
+        local old = jobTrip
+        jobTrip = nil
+
+        if not old or not old.Moved then return end
+        if LocalPlayer.Character ~= old.Character then return end
+
+        local humanoid = old.Character:FindFirstChildOfClass("Humanoid")
+        local root = old.Root
+
+        if humanoid and humanoid.Health > 0
+            and root.Parent and not root.Anchored then
+            humanoid:Move(Vector3.zero, false)
+            root.CFrame = old.Origin
+            root.AssemblyLinearVelocity = Vector3.zero
+            root.AssemblyAngularVelocity = Vector3.zero
+        end
+    end
+
+    local function PrepareJobTrip(character, humanoid, mustVisit)
+        local root = humanoid.RootPart
+        if not root or not root:IsA("BasePart")
+            or not root.Parent or root.Anchored then
+            Report("รอ RootPart พร้อมเปลี่ยนอาชีพ")
+            return false
+        end
+
+        if not jobTrip then
+            jobTrip = {
+                Character = character,
+                Root = root,
+                Origin = root.CFrame,
+                StartedAt = os.clock(),
+            }
+
+            -- ปิดฟาร์มก่อนล็อกสถานะ เพราะ Stop() มี cleanup ของฟาร์ม
+            SetOption("ZeroXAutoFarm", false)
+            JobAutomation.Switching = true
+        end
+
+        local trip = jobTrip
+
+        if trip.Character ~= character or trip.Root ~= root then
+            error("Character changed during Job trip")
+            return false
+        end
+
+        local now = os.clock()
+
+        if now - trip.StartedAt >= 20 then
+            error("Job trip timed out after 20 seconds")
+            return false
+        end
+
+        if LocalPlayer:GetAttribute("AutoOn") == true then
+            local menu = LocalPlayer:FindFirstChild("LumiMenuToggle")
+
+            if menu and menu:IsA("BindableEvent")
+                and now - (trip.LastAutoAt or -math.huge) >= 1 then
+                trip.LastAutoAt = now
+                menu:Fire("autoToggle")
+            end
+
+            Report("รอ Native Auto หยุดก่อนเปลี่ยนอาชีพ")
+            return false
+        end
+
+        -- Premium เปลี่ยนอาชีพที่ปลดล็อกแล้วจากระยะไกลได้
+        -- การ Unlock Special ยังไปหา NPC ตามรายงาน
+        if not mustVisit
+            and LocalPlayer:GetAttribute("Premium") == true then
+            return true
+        end
+
+        local npc = trip.Npc
+
+        if not npc or not npc:IsDescendantOf(workspace) then
+            local map = workspace:FindFirstChild("Map")
+            local npcs = map and map:FindFirstChild("NPCs")
+            npc = npcs and npcs:FindFirstChild("masterclass")
+
+            if npc and npc:IsA("Model") then
+                trip.Npc = npc
+            else
+                npc = nil
+            end
+        end
+
+        -- Fallback จากพิกัด Runtime ในรายงานที่แนบ
+        local pivot = npc and npc:GetPivot()
+            or CFrame.new(31.41, 4.68, -1.59)
+        local destination = (pivot * CFrame.new(0, 0, 5)).Position
+
+        humanoid:Move(Vector3.zero, false)
+
+        if not trip.Moved then
+            root.CFrame = CFrame.lookAt(destination, pivot.Position)
+            root.AssemblyLinearVelocity = Vector3.zero
+            root.AssemblyAngularVelocity = Vector3.zero
+            trip.Moved = true
+            trip.ArrivedAt = nil
+
+            Report("วาร์ปหา Master Aldric แล้ว รอตรวจตำแหน่ง")
+            return false
+        end
+
+        local distance = (root.Position - pivot.Position).Magnitude
+
+        if distance > 15 or LocalPlayer.GameplayPaused then
+            trip.ArrivedAt = nil
+            Report("รอใกล้ Master Aldric / รอ Streaming")
+            return false
+        end
+
+        trip.ArrivedAt = trip.ArrivedAt or now
+
+        if now - trip.ArrivedAt < 1.5 then
+            Report("ถึง Master Aldric รอก่อนเปลี่ยนอาชีพ")
+            return false
+        end
+
+        return true
+    end
+
+    local function RestoreFarm()
+        FinishJobTrip()
+        JobAutomation.Switching = false
+
+        if not saved then return end
+
+        -- ปิดก่อนคืนโหมด ป้องกันฟาร์มผิดเป้าระหว่างคืนค่า
+        SetOption("ZeroXAutoFarm", false)
+        SetOption("ZeroXFarmMode", saved.Mode)
+        SetOption("ZeroXAutoFarm", saved.Enabled)
+
+        saved = nil
+    end
+
+    local function Stop(message)
+        enabled = false
+        pending = nil
+        RestoreFarm()
+
+        local toggle = Options.ZeroXAutoJob
+        if toggle and toggle.Value == true then
+            toggle:SetValue(false)
+        end
+
+        if message then Report(message) end
+    end
+
+    local function Train(message)
+        FinishJobTrip()
+        JobAutomation.Switching = false
+        SetOption("ZeroXFarmMode", "Farm Level")
+        SetOption("ZeroXAutoFarm", true)
+        Report(message)
+    end
+
+    local function ReadLevels()
+        local raw = LocalPlayer:GetAttribute("JobLevelsJson")
+        if type(raw) ~= "string" or raw == "" then
+            return nil
+        end
+
+        local ok, levels = pcall(function()
+            return HttpService:JSONDecode(raw)
+        end)
+
+        if ok and type(levels) == "table" then
+            return levels
+        end
+
+        return nil
+    end
+
+    local function Step()
+        if not enabled then return end
+
+        local character = LocalPlayer.Character
+        local humanoid = character
+            and character:FindFirstChildOfClass("Humanoid")
+
+        if not humanoid or humanoid.Health <= 0 then
+            Report("รอตัวละครเกิด")
+            return
+        end
+
+        local current = LocalPlayer:GetAttribute("Job")
+
+        if pending then
+            local elapsed = os.clock() - pending.At
+            local confirmed
+
+            if pending.Action == "Unlock" then
+                local unlocked = ReadSpecialJobs()
+                confirmed = unlocked and unlocked[pending.Id] == true
+            else
+                confirmed = current == pending.Id
+            end
+
+            if confirmed and elapsed >= 2.5 then
+                local completed = pending
+                pending = nil
+
+                -- Unlock สำเร็จยังต้อง ChangeJob ต่อ จึงอยู่ที่ NPC ก่อน
+                if completed.Action ~= "Unlock" then
+                    FinishJobTrip()
+                    JobAutomation.Switching = false
+                end
+
+                Report("ยืนยัน " .. completed.Action .. ": " .. completed.Id)
+            elseif elapsed >= 8 then
+                Stop("ยังไม่ยืนยัน " .. pending.Action .. ": " .. pending.Id
+                    .. " — หยุดเพื่อไม่ส่งซ้ำ")
+            else
+                Report("รอ " .. pending.Action .. ": " .. pending.Id)
+            end
+
+            return
+        end
+
+        if current == selected then
+            Stop("สำเร็จ: ใช้อาชีพ " .. selected .. " แล้ว")
+            return
+        end
+
+        -- ไม่ให้ Farm With Party / Event แย่งควบคุมฟาร์ม
+        for _, id in ipairs({
+            "ZeroXFarmWithParty",
+            "ZeroXAutoBossHalloween",
+        }) do
+            if Options[id] and Options[id].Value == true then
+                SetOption("ZeroXAutoFarm", false)
+                Report("ปิด Farm With Party และ Auto Boss Halloween ก่อน")
+                return
+            end
+        end
+
+        local levels = ReadLevels()
+        if not levels then
+            Report("รอ JobLevelsJson ที่อ่านได้")
+            return
+        end
+
+        local nextJob = selected
+        local special = type(data.Special) == "table"
+            and data.Special[selected]
+
+        local specialUnlocked = false
+
+        if special ~= nil then
+            local unlocked = ReadSpecialJobs()
+
+            if not unlocked then
+                Report("รอ SpecialJobsJson ที่อ่านได้")
+                return
+            end
+
+            specialUnlocked = unlocked[selected] == true
+        end
+
+        if special ~= nil and not specialUnlocked then
+            if type(special) ~= "table"
+                or type(special.Req) ~= "table" then
+                Stop("ข้อมูล prerequisite ไม่สมบูรณ์: " .. selected)
+                return
+            end
+
+            local missing = {}
+
+            for id, required in pairs(special.Req) do
+                if type(id) ~= "string"
+                    or not added[id]
+                    or not NumberOK(required) then
+                    Stop("ข้อมูล prerequisite ไม่ถูกต้อง")
+                    return
+                end
+
+                local level = levels[id]
+                if level == nil then level = 0 end
+
+                if not NumberOK(level) then
+                    Report("รอข้อมูลเลเวลอาชีพ: " .. id)
+                    return
+                end
+
+                if id == current then
+                    local activeLevel =
+                        LocalPlayer:GetAttribute("JobLevel")
+
+                    if not NumberOK(activeLevel) then
+                        Report("รอ JobLevel")
+                        return
+                    end
+
+                    level = math.max(level, activeLevel)
+                end
+
+                if level < required then
+                    missing[id] = {
+                        Level = level,
+                        Required = required,
+                    }
+                end
+            end
+
+            -- ถ้าอาชีพปัจจุบันยังไม่ครบ ให้ฝึกต่อก่อนเปลี่ยน
+            if missing[current] then
+                local progress = missing[current]
+
+                Train(string.format(
+                    "ฝึก %s: %d / %d",
+                    current, progress.Level, progress.Required
+                ))
+                return
+            end
+
+            -- ใช้ลำดับจาก JobData ไม่ใช้ pairs สุ่มลำดับ
+            for _, id in ipairs(data.Order) do
+                if missing[id] then
+                    nextJob = id
+                    break
+                end
+            end
+
+            if next(missing) ~= nil and nextJob == selected then
+                Stop("พบ prerequisite ที่ยังไม่มีลำดับฝึกใน JobData.Order")
+                return
+            end
+
+            if nextJob == selected then
+                local cost = special.Gold or 0
+                local silver = LocalPlayer:GetAttribute("Silver")
+
+                if not NumberOK(cost) or not NumberOK(silver) then
+                    Report("รอข้อมูลค่าใช้จ่าย / Silver")
+                    return
+                end
+
+                if silver < cost then
+                    Train(string.format(
+                        "ฟาร์ม Silver: %d / %d", silver, cost
+                    ))
+                    return
+                end
+            end
+        end
+
+        if LocalPlayer:GetAttribute("CanChangeJob") ~= true
+            or LocalPlayer:GetAttribute("NeedJobPick") == true then
+            Report("รอเกมอนุญาตเปลี่ยนอาชีพ")
+            return
+        end
+
+        if type(JobAutomation.IsBusy) ~= "function" then
+            Report("ยังไม่ได้เชื่อม IsBusy กับ Auto Farm")
+            return
+        end
+
+        if JobAutomation.IsBusy() then
+            Report("รอเดินทาง / ซื้อขาย / เก็บของ / หลบสกิลให้เสร็จ")
+            return
+        end
+
+        local unlocking = nextJob == selected
+            and special ~= nil
+            and not specialUnlocked
+
+        local remoteName = unlocking and "UnlockJob" or "ChangeJob"
+        local remote = remotes:FindFirstChild(remoteName)
+
+        if not remote or not remote:IsA("RemoteEvent") then
+            Report("ไม่พบ " .. remoteName .. " ที่เป็น RemoteEvent")
+            return
+        end
+
+        if not PrepareJobTrip(character, humanoid, unlocking) then
+            return
+        end
+
+        pending = {
+            Id = nextJob,
+            Action = unlocking and "Unlock" or "Change",
+            At = os.clock(),
+        }
+
+        if unlocking then
+            remote:FireServer(nextJob)
+        else
+            -- บันทึก Loadout ตาม native contract เพื่อไม่ค้างรอหน้าถาม
+            remote:FireServer(nextJob, "save")
+        end
+
+        Report("ส่ง " .. pending.Action .. ": " .. nextJob)
+    end
+
+    section:AddDropdown("ZeroXTargetJob", {
+        Title = "Select Job",
+        Description = "เลือกอาชีพเป้าหมาย",
+        Values = choices,
+        Searchable = true,
+        AllowNull = true,
+
+        Callback = function(value)
+            if not alive then return end
+
+            if enabled then
+                Stop("หยุด Auto Job เพื่อเปลี่ยนเป้าหมาย")
+            end
+
+            selected = labelToId[value]
+        end,
+    })
+
+    section:AddToggle("ZeroXAutoJob", {
+        Title = "Auto Job",
+        Description = "ฟาร์ม prerequisite และ Silver "
+            .. "แล้วเปลี่ยนเป็นอาชีพที่เลือก อาจมีค่าเปลี่ยนอาชีพ",
+        Default = false,
+
+        Callback = function(value)
+            if not alive then return end
+
+            if value ~= true then
+                enabled = false
+                pending = nil
+                RestoreFarm()
+                return
+            end
+
+            if not selected then
+                Stop("เลือก Select Job ก่อน")
+                return
+            end
+
+            if not Options.ZeroXAutoFarm
+                or not Options.ZeroXFarmMode then
+                Stop("ไม่พบตัวควบคุม Auto Farm")
+                return
+            end
+
+            if not saved then
+                saved = {
+                    Mode = Options.ZeroXFarmMode.Value,
+                    Enabled = Options.ZeroXAutoFarm.Value,
+                }
+            end
+
+            enabled = true
+            Report("เริ่มตรวจเงื่อนไข: " .. selected)
+        end,
+    })
+
+    local worker = task.defer(function()
+        while alive do
+            if enabled then
+                local ok, err = xpcall(Step, debug.traceback)
+
+                if not ok then
+                    Stop("Auto Job Error — ดู Debug Log")
+                    warn("[Zero X / Job] " .. tostring(err))
+                end
+            end
+
+            task.wait(0.5)
+        end
+    end)
+
+    MacUI:OnUnload(function()
+        alive = false
+        enabled = false
+        pending = nil
+        JobAutomation.Switching = false
+        task.cancel(worker)
+    end)
+end)()
 
 -- Keep the original settings folders and custom theme loading.
 ThemeManager:SetLibrary(MacUI)
