@@ -1639,7 +1639,8 @@ do
         local PULL_GATHER_TIMEOUT = 12
         local PULL_GATHER_RADIUS = 12
         local mode = "Farm Level"
-        local selectedId
+        local selectedMonsterIds = {}
+        JobAutomation.SelectRotation = {}
         local worker
         local target
         local holding = false
@@ -2995,17 +2996,152 @@ do
             end
 
             if mode == "Select Monster" then
-                if not selectedId then
-                    return nil, nil, "Select a monster"
+                if next(selectedMonsterIds) == nil then
+                    return nil, nil, "Select at least one monster"
                 end
 
+                local state = JobAutomation.SelectRotation
+                local now = os.clock()
+                local candidates = {}
+                local foundInMap = false
+
+                -- ใช้ลำดับ zones เดิม และข้ามโซนที่ยังเข้าไม่ได้
                 for _, zone in ipairs(zones) do
-                    if zone.Ids[selectedId] then
-                        return zone, { [selectedId] = true }
+                    local ids = {}
+
+                    for id in pairs(selectedMonsterIds) do
+                        if zone.Ids[id] then
+                            ids[id] = true
+                        end
+                    end
+
+                    if next(ids) ~= nil then
+                        foundInMap = true
+
+                        if CanAccess(zone, level) then
+                            candidates[#candidates + 1] = {
+                                Zone = zone,
+                                Ids = ids,
+                            }
+                        end
                     end
                 end
 
-                return nil, nil, "Selected monster missing from MapData"
+                if #candidates == 0 then
+                    return nil, nil, foundInMap
+                        and "Selected monster zones locked / level too low"
+                        or "Selected monsters missing from MapData"
+                end
+
+                if now < (state.RetryAt or 0) then
+                    return nil, nil, "Selected zones empty: waiting to retry"
+                end
+
+                local area = GetActionZone()
+                local index
+
+                -- คงปลายทางระหว่างเดินทาง ไม่เปลี่ยนเพราะผ่านโซนอื่น
+                for i, candidate in ipairs(candidates) do
+                    if candidate.Zone.Id == state.GoalId then
+                        index = i
+                        break
+                    end
+                end
+
+                if not index then
+                    state.ArrivedAt = nil
+                    state.EmptyCount = 0
+
+                    -- เริ่มจากโซนปัจจุบันถ้ามีมอนชนิดที่เลือกใน MapData
+                    for i, candidate in ipairs(candidates) do
+                        if area and candidate.Zone.Id == area.Name then
+                            index = i
+                            break
+                        end
+                    end
+
+                    index = index or 1
+                    state.GoalId = candidates[index].Zone.Id
+                end
+
+                local candidate = candidates[index]
+                local zone = candidate.Zone
+
+                -- ระหว่างเดินทาง ส่งแผนเดิมให้ StepFarmTravel รับผิดชอบ
+                if not area or area.Name ~= zone.Id
+                    or farmTravelActive then
+                    state.ArrivedAt = nil
+                    return zone, candidate.Ids
+                end
+
+                -- อย่าตัดสินว่าไม่มีมอนขณะเกมหยุดรอ Streaming
+                -- หรือระหว่าง Auto Dodge ยังทำงาน
+                if LocalPlayer.GameplayPaused or bossDodgeActive then
+                    state.ArrivedAt = nil
+                    return zone, candidate.Ids
+                end
+
+                local zoneFolder = workspace:FindFirstChild("Zones")
+                local zonePart = zoneFolder
+                    and zoneFolder:FindFirstChild(zone.Id)
+
+                local map = workspace:FindFirstChild("Map")
+                local fields = map and map:FindFirstChild("BlockFields")
+                local field = fields and fields:FindFirstChild(zone.Id)
+                local island = field and field:FindFirstChild("Island")
+                local floor = island and island:FindFirstChild("Base")
+
+                if not zonePart or not zonePart:IsA("BasePart")
+                    or not floor or not floor:IsA("BasePart")
+                    or not floor.CanCollide then
+                    state.ArrivedAt = nil
+                    return zone, candidate.Ids
+                end
+
+                -- ใช้ Cache มอนเดิม ไม่สแกน GetDescendants เพิ่ม
+                for model in pairs(monsters) do
+                    local part = GetMonsterPart(model)
+                    local id = model:GetAttribute("MonsterId")
+
+                    if part
+                        and candidate.Ids[id] == true
+                        and model:GetAttribute("IsDummy") ~= true
+                        and InsideActionZone(zonePart, part.Position) then
+
+                        state.ArrivedAt = nil
+                        state.EmptyCount = 0
+                        return zone, candidate.Ids
+                    end
+                end
+
+                state.ArrivedAt = state.ArrivedAt or now
+
+                -- เผื่อ replication ของมอนหลังวาร์ปถึง
+                if now - state.ArrivedAt < 0.8 then
+                    return zone, candidate.Ids
+                end
+
+                state.ArrivedAt = nil
+                state.EmptyCount = (state.EmptyCount or 0) + 1
+
+                if state.EmptyCount >= #candidates then
+                    state.EmptyCount = 0
+                    state.RetryAt = now + 5
+
+                    print("[Zero X / Select Monster] All selected zones empty; "
+                        .. "retrying after 5 seconds")
+
+                    return nil, nil, "Selected zones empty: waiting to retry"
+                end
+
+                local nextIndex = index % #candidates + 1
+                local nextCandidate = candidates[nextIndex]
+                state.GoalId = nextCandidate.Zone.Id
+
+                print("[Zero X / Select Monster] No matching live monster in "
+                    .. zone.Id .. " -> " .. state.GoalId)
+
+                return nextCandidate.Zone, nextCandidate.Ids
             end
 
             local chosen
@@ -6277,6 +6413,7 @@ do
             Callback = function(value)
                 if not alive then return end
                 mode = value
+                JobAutomation.SelectRotation = {}
                 ClearTarget()
             end,
         })
@@ -6299,13 +6436,37 @@ do
 
         section:AddDropdown("ZeroXFarmMonster", {
             Title = "Select Monster",
-            Description = "ใช้เมื่อเลือกโหมด Select Monster",
+            Description = "เลือกมอนได้หลายชนิด ฟาร์มตัวใกล้ที่สุดในกลุ่ม "
+                .. "ให้ความสำคัญกับโซนปัจจุบันก่อน",
             Values = choices,
             Searchable = true,
+            Multi = true,
             AllowNull = true,
+            Default = {},
+
             Callback = function(value)
                 if not alive then return end
-                selectedId = optionToId[value]
+
+                table.clear(selectedMonsterIds)
+
+                -- รองรับค่ารูปแบบเดิมจาก Config ที่เลือกตัวเดียว
+                if type(value) == "string" then
+                    local id = optionToId[value]
+                    if id then
+                        selectedMonsterIds[id] = true
+                    end
+                elseif type(value) == "table" then
+                    for label, checked in pairs(value) do
+                        if checked == true then
+                            local id = optionToId[label]
+                            if id then
+                                selectedMonsterIds[id] = true
+                            end
+                        end
+                    end
+                end
+
+                JobAutomation.SelectRotation = {}
                 ClearTarget()
             end,
         });
