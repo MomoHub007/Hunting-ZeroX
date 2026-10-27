@@ -20,7 +20,57 @@ end
 
 local BASE = (getgenv and getgenv().MacUIBase) or "https://raw.githubusercontent.com/Kiwzu/Mac-OS-UI-LUA/refs/heads/main/"
 
-local MacUI = loadstring(game:HttpGet(BASE .. "MacUIFramework.lua"))()
+local MacUI
+
+do
+    local source = game:HttpGet(BASE .. "MacUIFramework.lua")
+
+    -- แก้เฉพาะสำเนา Framework ที่โหลดมาในสคริปต์นี้
+    local first = source:find(
+        "local function ParentGui(gui)", 1, true
+    )
+
+    local last = first and source:find("\nend\n", first, true)
+
+    if not first or not last then
+        error(
+            "[Zero X / UI] ParentGui source changed; "
+                .. "cannot apply PlayerGui placement"
+        )
+    end
+
+    local replacement = [[
+local function ParentGui(gui)
+    local player = Players.LocalPlayer
+    if not player then
+        error("[Zero X / UI] LocalPlayer unavailable")
+    end
+
+    local playerGui = player:WaitForChild("PlayerGui", 10)
+    if not playerGui or not playerGui:IsA("PlayerGui") then
+        error("[Zero X / UI] PlayerGui unavailable")
+    end
+
+    if gui:IsA("ScreenGui") then
+        gui.ResetOnSpawn = false
+    end
+
+    gui.Parent = playerGui
+end
+]]
+
+    source = source:sub(1, first - 1)
+        .. replacement
+        .. source:sub(last + #"\nend\n")
+
+    local chunk, compileError = loadstring(source)
+
+    if not chunk then
+        error("[Zero X / UI] " .. tostring(compileError))
+    end
+
+    MacUI = chunk()
+end
 local SaveManager = loadstring(game:HttpGet(BASE .. "SaveManager.lua"))()
 local InterfaceManager = loadstring(game:HttpGet(BASE .. "InterfaceManager.lua"))()
 local ThemeManager = loadstring(game:HttpGet(BASE .. "ThemeManager.lua"))()
@@ -1556,6 +1606,11 @@ do
         local alive = true
         local enabled = false
         local farmRequested = false
+        JobAutomation.FieldHunt = {
+            Leaders = false,
+            Bosses = false,
+            Target = nil,
+        }
         local pumpkinEnabled = false
         local partyFarmEnabled = false
         local partyFarmRadius = 60
@@ -1884,6 +1939,110 @@ do
             if type(nativeFarmIds) ~= "table"
                 or next(nativeFarmIds) == nil then
                 walkInfo:SetValue("Waiting for farm monster plan")
+                return false
+            end
+
+            -- Priority ใช้ Elite selection ของเกม:
+            -- ต้องไม่มี Only จึงจะเข้า Elite bucket และป้องกัน Threat แทรก
+            local priority = JobAutomation.FieldHunt.Target
+
+            if priority and priority.Parent then
+                local priorityId = priority:GetAttribute("MonsterId")
+
+                if type(priorityId) ~= "string"
+                    or nativeFarmIds[priorityId] ~= true then
+                    walkInfo:SetValue("Waiting for priority plan")
+                    return false
+                end
+
+                local isBoss = priority:GetAttribute("IsBoss") == true
+                    or priority:GetAttribute("IsMiniBoss") == true
+
+                -- เปิด Elite เพียงประเภทเดียวในแต่ละช่วง
+                local skipBoss = not isBoss
+                local skipLeader = isBoss
+
+                -- ยอมรับทั้งฟิลด์ที่ไม่มี และตารางว่างที่เกมส่งกลับมา
+                local onlyCleared = settings.Only == nil
+                    or (
+                        type(settings.Only) == "table"
+                        and next(settings.Only) == nil
+                    )
+
+                local debugState = JobAutomation.FieldHunt
+
+                if os.clock() >= (debugState.NextSettingsDebugAt or 0) then
+                    debugState.NextSettingsDebugAt = os.clock() + 5
+
+                    local failed = {}
+
+                    local function Check(name, actual, expected)
+                        if actual ~= expected then
+                            failed[#failed + 1] = name
+                                .. "=" .. tostring(actual)
+                                .. " (expected " .. tostring(expected) .. ")"
+                        end
+                    end
+
+                    Check("OnlyCleared", onlyCleared, true)
+                    Check("FixedArea", settings.FixedArea, false)
+                    Check("Loot", settings.Loot, false)
+                    Check("OpenBoxes", settings.OpenBoxes, false)
+                    Check("Mode", settings.Mode, "fight")
+                    Check("NormalAttack", settings.NormalAttack, true)
+                    Check("AttackLeader", settings.AttackLeader, true)
+                    Check("SkipBoss", settings.SkipBoss, skipBoss)
+                    Check("SkipLeader", settings.SkipLeader, skipLeader)
+
+                    print("[Zero X / Priority / Settings] Target="
+                        .. priorityId
+                        .. " AutoOn="
+                        .. tostring(LocalPlayer:GetAttribute("AutoOn"))
+                        .. " Failed="
+                        .. (#failed > 0 and table.concat(failed, " | ") or "none"))
+
+                    -- raw คือ BotJson ก่อนแก้ตารางและส่ง request
+                    print("[Zero X / Priority / BotJson] " .. raw)
+                end
+
+                local matches = onlyCleared
+                    and settings.FixedArea == false
+                    and settings.Loot == false
+                    and settings.OpenBoxes == false
+                    and settings.Mode == "fight"
+                    and settings.NormalAttack == true
+                    and settings.AttackLeader == true
+                    and settings.SkipBoss == skipBoss
+                    and settings.SkipLeader == skipLeader
+
+                if matches then
+                    return true
+                end
+
+                local remote = remotes:FindFirstChild("SetBotSettings")
+                if not remote or not remote:IsA("RemoteEvent") then
+                    walkInfo:SetValue("SetBotSettings unavailable")
+                    return false
+                end
+
+                if os.clock() - lastRoamRequest >= 1 then
+                    lastRoamRequest = os.clock()
+
+                    -- ส่ง settings ทั้งชุด เก็บ Skills / Potion settings เดิม
+                    settings.Only = nil
+                    settings.FixedArea = false
+                    settings.Loot = false
+                    settings.OpenBoxes = false
+                    settings.Mode = "fight"
+                    settings.NormalAttack = true
+                    settings.AttackLeader = true
+                    settings.SkipBoss = skipBoss
+                    settings.SkipLeader = skipLeader
+
+                    remote:FireServer(settings)
+                end
+
+                walkInfo:SetValue("Waiting for native elite priority")
                 return false
             end
 
@@ -2710,7 +2869,113 @@ do
             return chosen, ids
         end
 
+        JobAutomation.FieldHunt.Plan = function()
+            local state = JobAutomation.FieldHunt
+
+            if not state.Leaders and not state.Bosses then
+                state.Target = nil
+                return nil
+            end
+
+            local area = GetActionZone()
+            local zone = area and zoneById[area.Name]
+
+            -- ไม่แทรกแผนบอสผ่านประตูในห้องบอส
+            if not zone or zone.Data.BossRoom == true then
+                state.Target = nil
+                return nil
+            end
+
+            local character = LocalPlayer.Character
+            local humanoid = character
+                and character:FindFirstChildOfClass("Humanoid")
+            local root = humanoid and humanoid.RootPart
+
+            if not root or not root:IsA("BasePart") then
+                return nil
+            end
+
+            local chosen
+            local chosenId
+            local bestRank = math.huge
+            local bestDistance = math.huge
+
+            for model in pairs(monsters) do
+                local part = GetMonsterPart(model)
+
+                if not part
+                    or not model.PrimaryPart
+                    or model:GetAttribute("IsDummy") == true
+                    or not InsideActionZone(area, part.Position) then
+                    continue
+                end
+
+                local id = model:GetAttribute("MonsterId")
+                local def = type(id) == "string" and monsterData[id]
+
+                if type(def) ~= "table" then
+                    continue
+                end
+
+                local isBoss = model:GetAttribute("IsBoss") == true
+                    or model:GetAttribute("IsMiniBoss") == true
+                    or def.Boss == true
+                    or def.MiniBoss == true
+                    or def.HalloweenPumpkin == true
+
+                local isLeader = not isBoss and (
+                    model:GetAttribute("IsLeader") == true
+                    or def.Leader == true
+                )
+
+                local rank
+
+                if isBoss and state.Bosses then
+                    rank = 1
+                elseif isLeader and state.Leaders then
+                    rank = 2
+                end
+
+                if not rank then continue end
+
+                local distance = (part.Position - root.Position).Magnitude
+
+                -- คงตัวเดิมภายในประเภทเดียวกันจนตาย/ออกนอกโซน
+                -- Boss ยังมีสิทธิ์แทรก Leader เมื่อปรากฏ
+                local keeping = model == state.Target
+                local chosenKeeping = chosen == state.Target
+
+                if rank < bestRank
+                    or (rank == bestRank and keeping and not chosenKeeping)
+                    or (rank == bestRank and not chosenKeeping
+                        and distance < bestDistance) then
+
+                    chosen = model
+                    chosenId = id
+                    bestRank = rank
+                    bestDistance = distance
+                end
+            end
+
+            state.Target = chosen
+
+            if chosen then
+                return zone, { [chosenId] = true }, nil, nil, chosen
+            end
+
+            return nil
+        end
+
         local function BuildPlan(level)
+            local priorityZone, priorityIds, priorityReason,
+                priorityGate, priorityTarget =
+                    JobAutomation.FieldHunt.Plan()
+
+            if priorityZone then
+                return priorityZone, priorityIds, priorityReason,
+                    priorityGate, priorityTarget
+            end
+
             if partyFarmEnabled then
                 return BuildPartyFarmPlan(level)
             end
@@ -4248,7 +4513,7 @@ do
         combatSection:AddToggle("ZeroXAutoDodgeBossSkill", {
             Title = "Auto Dodge Skill",
             Description = "หลบสกิลบอสปลดด่าน บอสประจำโซน "
-                .. "Leader และ Pumpkin Spider ที่กำลังเป็นเป้าหมาย",
+                .. "Leader และ Pumpkin Spider",
             Default = false,
 
             Callback = function(value)
@@ -4508,6 +4773,12 @@ do
 
             -- ใช้ Cache เดิม ซึ่งรองรับมอนเกิดใหม่และถูกลบ
             for candidate in pairs(monsters) do
+                local priorityTarget = JobAutomation.FieldHunt.Target
+
+                if priorityTarget and candidate ~= priorityTarget then
+                    continue
+                end
+
                 if not candidate:IsA("Model")
                     or candidate:GetAttribute("IsDummy") == true then
                     continue
@@ -4549,9 +4820,6 @@ do
             tracker.Value = nearest
             target = nearest
             holding = false
-
-            -- เลือกเป้า แล้วให้ Native Auto เดินและโจมตีตามปกติ
-            setTarget:FireServer(nearest, false)
         end
 
         JobAutomation.IsBusy = function()
@@ -4919,13 +5187,44 @@ do
                     return
                 end
 
-                StepNativeFarmWalk(
-                    zone, target, tracker, root
-                )
+                local priorityTarget = JobAutomation.FieldHunt.Target
 
-                SelectNearestFarmTarget(
-                    zone, ids, tracker, root
-                )
+                if priorityTarget then
+                    StepNativeFarmWalk(
+                        zone, priorityTarget, tracker, root
+                    )
+
+                    -- รอ settings ยืนยันก่อนส่งต่อเป้าหมาย
+                    if LocalPlayer:GetAttribute("AutoOn") ~= true
+                        or not EnsureNativeRoam() then
+                        return
+                    end
+
+                    -- เปลี่ยนเมื่อแผนเลือกตัวใหม่เท่านั้น ไม่เขียนทับทุก Tick
+                    local state = JobAutomation.FieldHunt
+                    if state.NativeTarget ~= priorityTarget then
+                        state.NativeTarget = priorityTarget
+
+                        -- ล้าง manual lock เก่าผ่าน Changed listener ของเกม
+                        tracker.Value = nil
+                        tracker.Value = priorityTarget
+                        target = priorityTarget
+                        holding = false
+
+                        print("[Zero X / Priority] Native target: "
+                            .. priorityTarget.Name)
+                    end
+                else
+                    JobAutomation.FieldHunt.NativeTarget = nil
+
+                    StepNativeFarmWalk(
+                        zone, target, tracker, root
+                    )
+
+                    SelectNearestFarmTarget(
+                        zone, ids, tracker, root
+                    )
+                end
 
                 return
             end
@@ -5342,6 +5641,49 @@ do
                 end
             end)
         end
+
+        (function()
+            local function SetPriority(key, value)
+                if not alive then return end
+
+                local state = JobAutomation.FieldHunt
+                state[key] = value == true
+
+                -- ให้คำนวณเป้าหมายใหม่ในรอบ Worker ถัดไป
+                state.Target = nil
+                state.NativeTarget = nil
+
+                if value == true then
+                    local option = Options.ZeroXAutoFarm
+
+                    if option and option.Value ~= true then
+                        option:SetValue(true)
+                    else
+                        Start()
+                    end
+                end
+            end
+
+            combatSection:AddToggle("ZeroXAttackZoneLeaders", {
+                Title = "Attack Leaders",
+                Description = "ให้ความสำคัญกับ Leader ในโซนปัจจุบัน ",
+                Default = false,
+
+                Callback = function(value)
+                    SetPriority("Leaders", value)
+                end,
+            })
+
+            combatSection:AddToggle("ZeroXAttackZoneBosses", {
+                Title = "Attack Mini-bosses / Bosses",
+                Description = "ให้ความสำคัญกับ Mini-boss และ Boss ในโซนปัจจุบัน ",
+                Default = false,
+
+                Callback = function(value)
+                    SetPriority("Bosses", value)
+                end,
+            })
+        end)();
 
         (function()
             local active = true
@@ -5898,12 +6240,33 @@ do
         end)()
 
         local choices = {}
+
         for id, data in pairs(catalog) do
             local name = type(data.Name) == "string" and data.Name or id
-            local label = name .. " [" .. id .. "]"
+            local level = type(data.Level) == "number"
+                and tostring(data.Level) or "?"
+
+            local category = "Normal"
+
+            if data.Boss == true then
+                category = "Boss"
+            elseif data.HalloweenPumpkin == true then
+                category = "Halloween Mini-boss"
+            elseif data.MiniBoss == true then
+                category = "Mini-boss"
+            elseif data.Leader == true then
+                category = "Leader"
+            end
+
+            local label = string.format(
+                "Lv.%s | %s | %s [%s]",
+                level, category, name, id
+            )
+
             optionToId[label] = id
             table.insert(choices, label)
         end
+
         table.sort(choices)
 
         section:AddDropdown("ZeroXFarmMode", {
@@ -5945,7 +6308,225 @@ do
                 selectedId = optionToId[value]
                 ClearTarget()
             end,
-        })
+        });
+
+        (function()
+            local dropdown = Options.ZeroXFarmMonster
+            if not dropdown then return end
+
+            local module = shared:FindFirstChild("MonsterIcon")
+
+            if not module or not module:IsA("ModuleScript") then
+                warn("[Zero X / Monster Portrait] MonsterIcon unavailable")
+                return
+            end
+
+            local loaded, MonsterIcon = pcall(require, module)
+
+            if not loaded or type(MonsterIcon) ~= "table"
+                or type(MonsterIcon.New) ~= "function" then
+                warn("[Zero X / Monster Portrait] Cannot load MonsterIcon: "
+                    .. tostring(MonsterIcon))
+                return
+            end
+
+            local originalOpen = dropdown.Open
+            if type(originalOpen) ~= "function" then return end
+
+            -- ปรับเฉพาะเมนูของ Select Monster ตัวนี้
+            dropdown.Open = function(self)
+                local previousPopup = Window.ActivePopup
+                originalOpen(self)
+
+                local popup = Window.ActivePopup
+
+                if not popup or popup == previousPopup
+                    or not popup.Canvas
+                    or type(popup.Connect) ~= "function" then
+                    return
+                end
+
+                -- เส้นทางนี้อ้างอิงจาก _OpenMenu ใน Framework ล่าสุด
+                local scroll = popup.Canvas:FindFirstChild("Items")
+                if not scroll or not scroll:IsA("ScrollingFrame") then
+                    return
+                end
+
+                local listFrame = scroll:FindFirstChildOfClass("Frame")
+                if not listFrame then return end
+
+                scroll.ClipsDescendants = true
+
+                local entries = {}
+                local disposed = false
+                local queued = false
+
+                for _, item in ipairs(listFrame:GetChildren()) do
+                    if item:IsA("TextButton") and item.Name == "Item" then
+                        local value = self.Values[item.LayoutOrder]
+                        local id = optionToId[value]
+                        local label = item:FindFirstChildOfClass("TextLabel")
+
+                        if id and label then
+                            item.Size = UDim2.new(1, 0, 0, 44)
+
+                            label.Position = UDim2.fromOffset(66, 0)
+                            label.Size = UDim2.new(1, -72, 1, 0)
+                            label.TextSize = 12
+
+                            local holder = Instance.new("Frame")
+                            holder.Name = "ZeroXMonsterPortrait"
+                            holder.BackgroundTransparency = 1
+                            holder.BorderSizePixel = 0
+                            holder.AnchorPoint = Vector2.new(0, 0.5)
+                            holder.Position = UDim2.new(0, 26, 0.5, 0)
+                            holder.Size = UDim2.fromOffset(34, 34)
+                            holder.ClipsDescendants = true
+                            holder.Parent = item
+
+                            table.insert(entries, {
+                                Item = item,
+                                Holder = holder,
+                                Id = id,
+                                Viewport = nil,
+                                Failed = false,
+                            })
+                        end
+                    end
+                end
+
+                local function IsCurrent()
+                    -- ตรวจสถานะ Lua เท่านั้น ไม่อ่าน Instance ในฟังก์ชันนี้
+                    return not disposed
+                        and alive
+                        and not MacUI.Unloaded
+                        and Window.ActivePopup == popup
+                end
+
+                local function RefreshPortraits()
+                    if not IsCurrent() then return end
+
+                    local top = scroll.AbsolutePosition.Y
+                    local bottom = top + scroll.AbsoluteSize.Y
+
+                    for _, entry in ipairs(entries) do
+                        if not IsCurrent() then return end
+
+                        local item = entry.Item
+                        local itemTop = item.AbsolutePosition.Y
+                        local visible = item.Visible
+                            and itemTop + item.AbsoluteSize.Y > top
+                            and itemTop < bottom
+
+                        if not visible then
+                            if entry.Viewport then
+                                entry.Viewport:Destroy()
+                                entry.Viewport = nil
+                            end
+                        elseif not entry.Viewport and not entry.Failed then
+                            local ok, result = xpcall(function()
+                                local viewport = MonsterIcon.New(
+                                    entry.Holder,
+                                    entry.Id,
+                                    UDim2.fromScale(1, 1),
+                                    UDim2.fromOffset(0, 0)
+                                )
+
+                                -- ตรวจ Instance ภายในตัวดัก Error เดียวกัน
+                                if typeof(viewport) ~= "Instance"
+                                    or not viewport:IsA("ViewportFrame") then
+                                    error("MonsterIcon.New did not return a ViewportFrame")
+                                end
+
+                                if not IsCurrent() then
+                                    viewport:Destroy()
+                                    return nil
+                                end
+
+                                return viewport
+                            end, debug.traceback)
+
+                            if ok then
+                                entry.Viewport = result
+                            else
+                                entry.Failed = true
+
+                                -- ไม่แตะ Holder ซ้ำหลังการสร้างรูปล้ม
+                                -- ส่วนที่สร้างไว้จะถูกทำลายพร้อม Popup ตามเดิม
+                                warn(
+                                    "[Zero X / Monster Portrait / Build Failed]"
+                                        .. " MonsterId=" .. tostring(entry.Id)
+                                        .. "\n" .. tostring(result)
+                                )
+                            end
+                        end
+                    end
+                end
+
+                local function QueueRefresh()
+                    if queued or not IsCurrent() then return end
+                    queued = true
+
+                    task.defer(function()
+                        local ok, err = xpcall(
+                            RefreshPortraits,
+                            debug.traceback
+                        )
+
+                        queued = false
+
+                        if not ok then
+                            -- หยุดสร้างรูปของ Popup รอบนี้
+                            -- ไม่เรียก IsCurrent หรือแตะ Instance ซ้ำใน error handler
+                            disposed = true
+
+                            warn("[Zero X / Monster Portrait] "
+                                .. "Portrait refresh stopped:\n"
+                                .. tostring(err))
+                        end
+                    end)
+                end
+
+                -- ใช้ระบบ Connection ของ Popup เดิม:
+                -- Framework จะ Disconnect เมื่อปิดเมนู
+                popup:Connect(
+                    scroll:GetPropertyChangedSignal("CanvasPosition"),
+                    QueueRefresh
+                )
+
+                popup:Connect(
+                    scroll:GetPropertyChangedSignal("AbsoluteSize"),
+                    QueueRefresh
+                )
+
+                local layout = listFrame:FindFirstChildOfClass("UIListLayout")
+                if layout then
+                    popup:Connect(
+                        layout:GetPropertyChangedSignal("AbsoluteContentSize"),
+                        QueueRefresh
+                    )
+                end
+
+                for _, entry in ipairs(entries) do
+                    popup:Connect(
+                        entry.Item:GetPropertyChangedSignal("Visible"),
+                        QueueRefresh
+                    )
+                end
+
+                popup:Connect(popup.Canvas.Destroying, function()
+                    disposed = true
+                end)
+
+                QueueRefresh()
+            end
+
+            MacUI:OnUnload(function()
+                if dropdown.Open ~= originalOpen then
+                    dropdown.Open = originalOpen
+                end
+            end)
+        end)();
 
         section:AddToggle("ZeroXAutoFarm", {
             Title = "Auto Farm",
